@@ -1,0 +1,10 @@
+[package]
+name = "meshline-sim"
+version = "0.1.0"
+edition = "2021"
+authors = ["MeshLine Team"]
+description = "Network simulation engine to stress test N-node mesh propagation, battery duty-cycling, and SOS reachability"
+
+[dependencies]
+meshline-core = { path = "../meshline-core" }
+rand = "0.8"

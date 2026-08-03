@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/meshline-core",
+    "crates/meshline-ffi",
+    "crates/meshline-sim",
+]

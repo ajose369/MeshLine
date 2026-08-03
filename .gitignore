@@ -1,0 +1,17 @@
+# Rust build target
+/target/
+/.cargo/
+
+# Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+
+# OS and IDE temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.mbtiles
