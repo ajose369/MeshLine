@@ -1,7 +1,7 @@
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jboolean, jbyteArray, jint};
 use jni::JNIEnv;
-use meshline_core::{BatteryPowerState, MeshNode, ResourcePin, ResourcePinType};
+use meshline_core::{BatteryPowerState, MeshNode};
 use std::sync::Mutex;
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -22,7 +22,7 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_initNode(
 
 #[no_mangle]
 pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_createPublicSos(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     message: JString,
     lat: f32,
@@ -56,7 +56,11 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_processIncomi
     _class: JClass,
     raw_packet: jbyteArray,
 ) -> jbyteArray {
-    let bytes = match env.convert_byte_array(raw_packet) {
+    if raw_packet.is_null() {
+        return std::ptr::null_mut();
+    }
+    let array_obj = unsafe { JByteArray::from_raw(raw_packet) };
+    let bytes = match env.convert_byte_array(&array_obj) {
         Ok(b) => b,
         Err(_) => return std::ptr::null_mut(),
     };
@@ -94,8 +98,6 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_updateBattery
         } else {
             BatteryPowerState::LowPowerSaver
         };
-        // Safety check to set battery state
-        let mut engine_state = node.routing.battery_state;
-        engine_state = state;
+        node.routing.set_battery_state(state);
     }
 }

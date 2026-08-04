@@ -33,6 +33,7 @@ pub struct ResourcePin {
     pub created_at: u64,
     pub expires_at: u64,
     pub creator_pubkey: [u8; 32],
+    #[serde(with = "crate::packet::schema::serde_bytes_64")]
     pub signature: [u8; 64],
 }
 

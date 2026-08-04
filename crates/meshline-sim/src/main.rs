@@ -1,5 +1,4 @@
-use meshline_core::{BatteryPowerState, MeshtasticBridgeFrame, MeshNode, PacketType};
-use rand::Rng;
+use meshline_core::{BatteryPowerState, MeshNode};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 struct MeshSimulator {
@@ -66,8 +65,7 @@ impl MeshSimulator {
 
     fn set_battery_state_all(&mut self, state: BatteryPowerState) {
         for node in &self.nodes {
-            let mut current_state = node.routing.battery_state;
-            current_state = state;
+            node.routing.set_battery_state(state);
         }
     }
 

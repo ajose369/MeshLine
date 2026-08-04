@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -46,10 +45,36 @@ pub struct PacketHeader {
     pub pow_nonce: u32,
 }
 
+pub mod serde_bytes_64 {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        if bytes.len() == 64 {
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&bytes);
+            Ok(arr)
+        } else {
+            Err(D::Error::custom(format!("expected 64 bytes, got {}", bytes.len())))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
     pub header: PacketHeader,
     pub payload: Vec<u8>,
+    #[serde(with = "serde_bytes_64")]
     pub signature: [u8; 64],
 }
 

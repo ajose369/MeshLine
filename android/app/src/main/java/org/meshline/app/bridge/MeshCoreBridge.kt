@@ -20,6 +20,47 @@ object MeshCoreBridge {
     external fun processIncomingPacket(rawPacket: ByteArray): ByteArray?
     external fun updateBatteryState(batteryLevel: Int, isCharging: Boolean)
 
+    // Safe wrappers with fallbacks
+    fun initNodeSafe(): Boolean {
+        if (!isNativeLoaded) return false
+        return try {
+            initNode()
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        }
+    }
+
+    fun createPublicSosSafe(message: String, lat: Float, lon: Float): ByteArray {
+        if (isNativeLoaded) {
+            try {
+                val packet = createPublicSos(message, lat, lon)
+                if (packet != null) return packet
+            } catch (e: UnsatisfiedLinkError) {
+                // fall through to fallback
+            }
+        }
+        return createPublicSosFallback(message, lat, lon)
+    }
+
+    fun processIncomingPacketSafe(rawPacket: ByteArray): ByteArray? {
+        if (!isNativeLoaded) return null
+        return try {
+            processIncomingPacket(rawPacket)
+        } catch (e: UnsatisfiedLinkError) {
+            null
+        }
+    }
+
+    fun updateBatteryStateSafe(batteryLevel: Int, isCharging: Boolean) {
+        if (isNativeLoaded) {
+            try {
+                updateBatteryState(batteryLevel, isCharging)
+            } catch (e: UnsatisfiedLinkError) {
+                // ignore
+            }
+        }
+    }
+
     // Fallback methods when native lib is absent
     fun createPublicSosFallback(message: String, lat: Float, lon: Float): ByteArray {
         val sosId = UUID.randomUUID().toString().take(16)

@@ -5,7 +5,7 @@ pub mod routing;
 pub mod security;
 pub mod transport;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::Rng;
 use sha2::{Digest, Sha256};

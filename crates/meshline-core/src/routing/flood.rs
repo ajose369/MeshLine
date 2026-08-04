@@ -25,15 +25,24 @@ pub enum BatteryPowerState {
 
 pub struct RoutingEngine {
     seen_cache: Mutex<LruCache<[u8; 16], u64>>,
-    pub battery_state: BatteryPowerState,
+    battery_state: Mutex<BatteryPowerState>,
 }
 
 impl RoutingEngine {
     pub fn new(capacity: usize) -> Self {
         Self {
             seen_cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap())),
-            battery_state: BatteryPowerState::Normal,
+            battery_state: Mutex::new(BatteryPowerState::Normal),
         }
+    }
+
+    pub fn set_battery_state(&self, state: BatteryPowerState) {
+        let mut b = self.battery_state.lock().unwrap();
+        *b = state;
+    }
+
+    pub fn get_battery_state(&self) -> BatteryPowerState {
+        *self.battery_state.lock().unwrap()
     }
 
     pub fn should_relay(&self, packet: &mut Packet) -> Result<bool, RoutingError> {
@@ -53,7 +62,8 @@ impl RoutingEngine {
         packet.header.ttl -= 1;
 
         // 4. Probabilistic Flood Dampening based on Battery State & SOS priority
-        let relay_probability = match (packet.header.packet_type, self.battery_state) {
+        let current_battery = self.get_battery_state();
+        let relay_probability = match (packet.header.packet_type, current_battery) {
             (PacketType::PublicSos, _) | (PacketType::PrivateSos, _) => 1.0, // Always relay SOS
             (_, BatteryPowerState::Charging) => 1.0,
             (_, BatteryPowerState::Normal) => 0.85,
@@ -74,7 +84,7 @@ impl RoutingEngine {
     }
 
     pub fn is_seen(&self, msg_id: &[u8; 16]) -> bool {
-        let mut cache = self.seen_cache.lock().unwrap();
+        let cache = self.seen_cache.lock().unwrap();
         cache.contains(msg_id)
     }
 

@@ -4,24 +4,27 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
+val ObsidianBackground = Color(0xFF0B0E14)
+val GlassSurfaceCard = Color(0xFF161B22)
+val GlassSurfaceBorder = Color(0xFF2D3545)
 val SignalRed = Color(0xFFFF3B30)
-val SafetyYellow = Color(0xFFFFCC00)
-val EmergencyGreen = Color(0xFF34C759)
-val DarkSlateBackground = Color(0xFF121418)
-val DarkSurfaceCard = Color(0xFF1E222A)
-val TextLightPrimary = Color(0xFFF2F4F7)
-val TextSecondary = Color(0xFF98A2B3)
+val SignalRedGlow = Color(0x66FF3B30)
+val NeonCyan = Color(0xFF00E5FF)
+val SafetyAmber = Color(0xFFFFB300)
+val EmergencyGreen = Color(0xFF30D158)
+val TextPrimary = Color(0xFFF0F4F8)
+val TextMuted = Color(0xFF8B949E)
 
 private val DarkColorScheme = darkColorScheme(
     primary = SignalRed,
-    secondary = SafetyYellow,
+    secondary = NeonCyan,
     tertiary = EmergencyGreen,
-    background = DarkSlateBackground,
-    surface = DarkSurfaceCard,
+    background = ObsidianBackground,
+    surface = GlassSurfaceCard,
     onPrimary = Color.White,
     onSecondary = Color.Black,
-    onBackground = TextLightPrimary,
-    onSurface = TextLightPrimary
+    onBackground = TextPrimary,
+    onSurface = TextPrimary
 )
 
 @Composable
