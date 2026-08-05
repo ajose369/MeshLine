@@ -40,6 +40,11 @@ fun MapScreen() {
     val storeAndForward = remember { StoreAndForwardManager.getInstance(context) }
     val dbPins by storeAndForward.pinsFlow.collectAsState()
 
+    // Sync active pins from Rust FFI when map is viewed
+    LaunchedEffect(Unit) {
+        storeAndForward.syncResourcePins()
+    }
+
     var showDropPinDialog by remember { mutableStateOf(false) }
     var newPinTitle by remember { mutableStateOf("") }
     var selectedPinType by remember { mutableStateOf("Water Point") }
@@ -188,25 +193,19 @@ fun MapScreen() {
                 Button(
                     onClick = {
                         if (newPinTitle.isNotBlank()) {
-                            val newPin = ResourcePinEntity(
-                                pinId = UUID.randomUUID().toString(),
-                                pinType = when (selectedPinType) {
+                            storeAndForward.createAndBroadcastSignedPin(
+                                label = newPinTitle,
+                                latitude = 37.7749f,
+                                longitude = -122.4194f,
+                                type = when (selectedPinType) {
                                     "Water Point" -> "WaterPoint"
                                     "Shelter" -> "Shelter"
                                     "Medical Station" -> "MedicalStation"
                                     "Hazard" -> "Hazard"
                                     else -> "WaterPoint"
                                 },
-                                latitude = 37.7749f,
-                                longitude = -122.4194f,
-                                label = newPinTitle,
-                                createdAt = System.currentTimeMillis(),
-                                expiresAt = System.currentTimeMillis() + 24 * 3600 * 1000,
-                                creatorPubkey = "Me",
-                                signatureHex = "0000000000000000",
-                                verifiedCount = 1
+                                expiresInSecs = 24 * 3600
                             )
-                            storeAndForward.upsertResourcePin(newPin)
                             newPinTitle = ""
                             showDropPinDialog = false
                         }

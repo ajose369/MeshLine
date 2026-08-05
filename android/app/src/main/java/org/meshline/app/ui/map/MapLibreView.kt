@@ -11,7 +11,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import org.meshline.app.ui.theme.SafetyYellow
+import org.meshline.app.ui.theme.SafetyAmber
 
 @Composable
 fun MapLibreView(
@@ -32,7 +32,7 @@ fun MapLibreView(
                     text = "🗺️ Vector Offline Map Active (MapLibre Engine)",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
-                    color = SafetyYellow
+                    color = SafetyAmber
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(

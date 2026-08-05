@@ -37,6 +37,31 @@ pub struct ResourcePin {
     pub signature: [u8; 64],
 }
 
+impl ResourcePin {
+    pub fn compute_signing_payload(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.pin_id);
+        data.push(self.pin_type as u8);
+        data.extend_from_slice(&self.latitude.to_le_bytes());
+        data.extend_from_slice(&self.longitude.to_le_bytes());
+        data.extend_from_slice(self.label.as_bytes());
+        data.extend_from_slice(&self.created_at.to_le_bytes());
+        data.extend_from_slice(&self.expires_at.to_le_bytes());
+        data.extend_from_slice(&self.creator_pubkey);
+        data
+    }
+
+    pub fn verify_signature(&self) -> Result<(), PinError> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let vk = VerifyingKey::from_bytes(&self.creator_pubkey)
+            .map_err(|_| PinError::InvalidSignature)?;
+        let sig_payload = self.compute_signing_payload();
+        let sig = Signature::from_bytes(&self.signature);
+        vk.verify_strict(&sig_payload, &sig)
+            .map_err(|_| PinError::InvalidSignature)
+    }
+}
+
 pub struct GisPinStore {
     pins: Mutex<HashMap<[u8; 16], ResourcePin>>,
 }
@@ -49,6 +74,8 @@ impl GisPinStore {
     }
 
     pub fn upsert_pin(&self, pin: ResourcePin, current_time: u64) -> Result<(), PinError> {
+        pin.verify_signature()?;
+
         if pin.expires_at <= current_time {
             return Err(PinError::Expired);
         }

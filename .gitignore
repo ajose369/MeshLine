@@ -9,6 +9,7 @@ android/app/build/
 android/local.properties
 android/.idea/
 android/*.iml
+android/app/src/main/jniLibs/
 
 # OS and IDE temporary files
 .DS_Store

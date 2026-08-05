@@ -21,7 +21,7 @@ import org.meshline.app.ui.theme.*
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate()
+        super.onCreate(savedInstanceState)
 
         // Start background Mesh Relay Service
         val serviceIntent = Intent(this, MeshRelayService::class.java)

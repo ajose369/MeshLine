@@ -97,6 +97,71 @@ impl MeshNode {
         Ok(packet)
     }
 
+    pub fn create_signed_pin_packet(
+        &self,
+        pin_id: [u8; 16],
+        pin_type: ResourcePinType,
+        lat: f32,
+        lon: f32,
+        label: &str,
+        expires_in_secs: u64,
+    ) -> Result<Packet, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let expires_at = now + expires_in_secs;
+        let creator_pubkey = self.verifying_key.to_bytes();
+
+        let mut pin = ResourcePin {
+            pin_id,
+            pin_type,
+            latitude: lat,
+            longitude: lon,
+            label: label.to_string(),
+            created_at: now,
+            expires_at,
+            creator_pubkey,
+            signature: [0u8; 64],
+        };
+
+        let pin_signing_payload = pin.compute_signing_payload();
+        let pin_signature = self.signing_key.sign(&pin_signing_payload);
+        pin.signature = pin_signature.to_bytes();
+
+        self.pin_store.upsert_pin(pin.clone(), now).map_err(|e| e.to_string())?;
+
+        let payload_bytes = bincode::serialize(&pin).map_err(|e| e.to_string())?;
+
+        let mut packet = Packet {
+            header: PacketHeader {
+                version: 1,
+                packet_type: PacketType::ResourcePin,
+                ttl: 8,
+                flags: 0,
+                msg_id: pin_id,
+                sender_id: self.node_id,
+                recipient_id: [0u8; 16],
+                timestamp: now,
+                location: Some(LocationTag {
+                    latitude: lat,
+                    longitude: lon,
+                    accuracy_meters: 5,
+                }),
+                pow_nonce: 0,
+            },
+            payload: payload_bytes,
+            signature: [0u8; 64],
+        };
+
+        let signing_payload = packet.compute_signing_payload().map_err(|e| e.to_string())?;
+        let signature = self.signing_key.sign(&signing_payload);
+        packet.signature = signature.to_bytes();
+
+        Ok(packet)
+    }
+
     pub fn process_incoming(&self, raw_bytes: &[u8]) -> Result<(Packet, Option<Packet>), String> {
         let mut packet = Packet::from_bytes(raw_bytes).map_err(|e| e.to_string())?;
 
@@ -113,9 +178,23 @@ impl MeshNode {
         }
 
         // 3. Routing evaluation
-        let should_forward = self.routing.should_relay(&mut packet).map_err(|e| e.to_string())?;
+        let relay_result = self.routing.should_relay(&mut packet);
 
-        // 4. Generate ACK if recipient matches local node
+        // 4. Extract and store ResourcePin if packet matches type (and it's not a duplicate)
+        let is_duplicate = matches!(relay_result, Err(routing::flood::RoutingError::DuplicatePacket));
+        if !is_duplicate && packet.header.packet_type == PacketType::ResourcePin {
+            if let Ok(pin) = bincode::deserialize::<ResourcePin>(&packet.payload) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = self.pin_store.upsert_pin(pin, now);
+            }
+        }
+
+        let should_forward = relay_result.map_err(|e| e.to_string())?;
+
+        // 5. Generate ACK if recipient matches local node
         let ack_packet = if packet.header.recipient_id == self.node_id {
             Some(self.routing.create_ack(&packet.header, &self.node_id))
         } else {

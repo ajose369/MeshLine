@@ -17,10 +17,38 @@ object MeshCoreBridge {
 
     external fun initNode(): Boolean
     external fun createPublicSos(message: String, lat: Float, lon: Float): ByteArray?
+    external fun createSignedPinPacket(
+        pinIdBytes: ByteArray,
+        pinTypeVal: Int,
+        lat: Float,
+        lon: Float,
+        label: String,
+        expiresInSecs: Long
+    ): ByteArray?
+    external fun getActivePinsJson(): String?
     external fun processIncomingPacket(rawPacket: ByteArray): ByteArray?
     external fun updateBatteryState(batteryLevel: Int, isCharging: Boolean)
+    external fun createChatPacket(message: String, recipientIdHex: String): ByteArray?
+    external fun parsePacketJson(rawPacket: ByteArray): String?
 
     // Safe wrappers with fallbacks
+    fun createChatPacketSafe(message: String, recipientIdHex: String): ByteArray? {
+        if (!isNativeReady()) return null
+        return try {
+            createChatPacket(message, recipientIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            null
+        }
+    }
+
+    fun parsePacketJsonSafe(rawPacket: ByteArray): String? {
+        if (!isNativeReady()) return null
+        return try {
+            parsePacketJson(rawPacket)
+        } catch (e: UnsatisfiedLinkError) {
+            null
+        }
+    }
     fun initNodeSafe(): Boolean {
         if (!isNativeLoaded) return false
         return try {
@@ -40,6 +68,34 @@ object MeshCoreBridge {
             }
         }
         return createPublicSosFallback(message, lat, lon)
+    }
+
+    fun createSignedPinPacketSafe(
+        pinId: ByteArray,
+        pinTypeVal: Int,
+        lat: Float,
+        lon: Float,
+        label: String,
+        expiresInSecs: Long
+    ): ByteArray {
+        if (isNativeLoaded) {
+            try {
+                val packet = createSignedPinPacket(pinId, pinTypeVal, lat, lon, label, expiresInSecs)
+                if (packet != null) return packet
+            } catch (e: UnsatisfiedLinkError) {
+                // fall through to fallback
+            }
+        }
+        return createSignedPinPacketFallback(pinId, pinTypeVal, lat, lon, label, expiresInSecs)
+    }
+
+    fun getActivePinsJsonSafe(): String? {
+        if (!isNativeLoaded) return null
+        return try {
+            getActivePinsJson()
+        } catch (e: UnsatisfiedLinkError) {
+            null
+        }
     }
 
     fun processIncomingPacketSafe(rawPacket: ByteArray): ByteArray? {
@@ -65,6 +121,27 @@ object MeshCoreBridge {
     fun createPublicSosFallback(message: String, lat: Float, lon: Float): ByteArray {
         val sosId = UUID.randomUUID().toString().take(16)
         val payload = "SOS_V1|$sosId|$message|$lat|$lon|${System.currentTimeMillis()}"
+        return payload.toByteArray(Charsets.UTF_8)
+    }
+
+    fun createSignedPinPacketFallback(
+        pinId: ByteArray,
+        pinTypeVal: Int,
+        lat: Float,
+        lon: Float,
+        label: String,
+        expiresInSecs: Long
+    ): ByteArray {
+        val pinIdStr = pinId.joinToString("") { "%02x".format(it) }
+        val typeStr = when (pinTypeVal) {
+            1 -> "WaterPoint"
+            2 -> "Shelter"
+            3 -> "MedicalStation"
+            4 -> "Hazard"
+            5 -> "Roadblock"
+            else -> "WaterPoint"
+        }
+        val payload = "PIN_V1|$pinIdStr|$typeStr|$lat|$lon|$label|${System.currentTimeMillis()}|${System.currentTimeMillis() + expiresInSecs * 1000}"
         return payload.toByteArray(Charsets.UTF_8)
     }
 
