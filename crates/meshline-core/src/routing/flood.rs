@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use thiserror::Error;
 
-use crate::packet::schema::{Packet, PacketHeader, PacketType};
+use crate::packet::schema::{Packet, PacketType};
 
 #[derive(Error, Debug)]
 pub enum RoutingError {
@@ -88,28 +88,105 @@ impl RoutingEngine {
         cache.contains(msg_id)
     }
 
-    pub fn create_ack(&self, original_header: &PacketHeader, node_id: &[u8; 16]) -> Packet {
-        let mut ack_msg_id = [0u8; 16];
-        rand::thread_rng().fill(&mut ack_msg_id);
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::schema::{LocationTag, PacketHeader, PROTOCOL_VERSION};
+
+    fn packet(msg_id: [u8; 16], packet_type: PacketType, ttl: u8) -> Packet {
         Packet {
             header: PacketHeader {
-                version: original_header.version,
-                packet_type: PacketType::Ack,
-                ttl: 8,
+                version: PROTOCOL_VERSION,
+                packet_type,
+                ttl,
                 flags: 0,
-                msg_id: ack_msg_id,
-                sender_id: *node_id,
-                recipient_id: original_header.sender_id,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                location: None,
+                msg_id,
+                sender_id: [1u8; 16],
+                sender_pubkey: [2u8; 32],
+                recipient_id: [0u8; 16],
+                timestamp: 1_700_000_000,
+                location: None::<LocationTag>,
                 pow_nonce: 0,
             },
-            payload: original_header.msg_id.to_vec(),
+            payload: Vec::new(),
             signature: [0u8; 64],
         }
+    }
+
+    #[test]
+    fn first_sighting_relays_and_decrements_ttl() {
+        let engine = RoutingEngine::new(64);
+        engine.set_battery_state(BatteryPowerState::Charging);
+        let mut p = packet([1u8; 16], PacketType::Chat, 5);
+        assert!(engine.should_relay(&mut p).unwrap());
+        assert_eq!(p.header.ttl, 4);
+    }
+
+    #[test]
+    fn second_sighting_is_a_duplicate() {
+        let engine = RoutingEngine::new(64);
+        engine.set_battery_state(BatteryPowerState::Charging);
+        let mut p = packet([9u8; 16], PacketType::Chat, 5);
+        engine.should_relay(&mut p.clone()).unwrap();
+        assert!(matches!(
+            engine.should_relay(&mut p),
+            Err(RoutingError::DuplicatePacket)
+        ));
+    }
+
+    #[test]
+    fn exhausted_ttl_stops_the_flood() {
+        let engine = RoutingEngine::new(64);
+        let mut p = packet([2u8; 16], PacketType::Chat, 1);
+        assert!(matches!(
+            engine.should_relay(&mut p),
+            Err(RoutingError::TtlZero)
+        ));
+    }
+
+    #[test]
+    fn sos_is_never_dampened_even_on_a_dying_battery() {
+        let engine = RoutingEngine::new(4096);
+        engine.set_battery_state(BatteryPowerState::LowPowerSaver);
+        // Across many distinct SOS packets, not one may be dropped.
+        for i in 0..200u8 {
+            let mut p = packet([i; 16], PacketType::PublicSos, 5);
+            assert!(
+                engine.should_relay(&mut p).unwrap(),
+                "SOS must bypass duty-cycle dampening"
+            );
+        }
+    }
+
+    #[test]
+    fn low_power_dampens_ordinary_chat() {
+        let engine = RoutingEngine::new(4096);
+        engine.set_battery_state(BatteryPowerState::LowPowerSaver);
+        let mut dampened = 0;
+        for i in 0..200u8 {
+            let mut p = packet([i; 16], PacketType::Chat, 5);
+            if matches!(engine.should_relay(&mut p), Err(RoutingError::Dampened)) {
+                dampened += 1;
+            }
+        }
+        // Nominal rate is 30% relay, so ~70% dropped. Bounds are loose enough
+        // not to flake while still catching a dampener that does nothing.
+        assert!(
+            (100..=200).contains(&dampened),
+            "expected substantial dampening, saw {dampened}/200"
+        );
+    }
+
+    #[test]
+    fn dedup_cache_evicts_oldest_entries() {
+        let engine = RoutingEngine::new(2);
+        engine.set_battery_state(BatteryPowerState::Charging);
+        engine.mark_seen(&[1u8; 16], 0);
+        engine.mark_seen(&[2u8; 16], 0);
+        engine.mark_seen(&[3u8; 16], 0);
+        assert!(!engine.is_seen(&[1u8; 16]), "oldest entry should be evicted");
+        assert!(engine.is_seen(&[3u8; 16]));
     }
 }

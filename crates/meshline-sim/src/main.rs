@@ -92,10 +92,10 @@ impl MeshSimulator {
         while let Some((curr_idx, bytes)) = queue.pop_front() {
             total_transmissions += 1;
             let node = &self.nodes[curr_idx];
-            match node.process_incoming(&bytes) {
-                Ok((forward_packet, _ack)) => {
-                    reached.insert(curr_idx);
-                    if let Ok(next_bytes) = forward_packet.to_bytes() {
+            if let Ok(outcome) = node.process_incoming(&bytes) {
+                reached.insert(curr_idx);
+                if outcome.should_relay {
+                    if let Ok(next_bytes) = outcome.packet.to_bytes() {
                         if let Some(neighbors) = self.adjacency.get(&curr_idx) {
                             for &n in neighbors {
                                 if !reached.contains(&n) {
@@ -105,11 +105,42 @@ impl MeshSimulator {
                         }
                     }
                 }
-                Err(_) => {}
             }
         }
 
         (reached.len(), total_transmissions)
+    }
+
+    /// Counts how many nodes accept a tampered SOS. Any acceptance at all means
+    /// the mesh will happily carry forged distress traffic, so the only passing
+    /// result here is zero.
+    fn run_forgery_simulation(&self, origin_idx: usize) -> (usize, usize) {
+        let origin = &self.nodes[origin_idx];
+        let packet = origin
+            .create_public_sos("SOS: genuine distress call", 37.7749, -122.4194)
+            .expect("Packet failed");
+        let genuine = packet.to_bytes().expect("Serialization failed");
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if idx == origin_idx {
+                continue;
+            }
+            // Rewrite the distress text, leaving the signature untouched: the
+            // classic "relay edits the message in flight" attack.
+            let mut forged = genuine.clone();
+            let tail = forged.len() - 70;
+            forged[tail] ^= 0xFF;
+
+            if node.process_incoming(&forged).is_ok() {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        (accepted, rejected)
     }
 }
 
@@ -126,16 +157,86 @@ fn main() {
     println!("Nodes Reached: {} / 49 ({:.1}%)", reached_1, (reached_1 as f32 / 49.0) * 100.0);
     println!("Total Packet Transmissions: {}", tx_1);
 
-    // Scenario 2: LoRa Hardware Bridge across Partitioned Clusters
+    // Scenario 2: LoRa Hardware Bridge across Partitioned Clusters.
+    //
+    // Cluster size is chosen so the bridge sits inside the TTL horizon. A line
+    // topology costs one hop per node, and DEFAULT_TTL is 8, so a chain longer
+    // than ~9 nodes cannot be traversed end to end no matter how healthy the
+    // radios are. That is a property of the protocol, not a bug in the bridge.
+    const CLUSTER: usize = 4;
+    let total_2 = CLUSTER * 2;
     println!("\n--- SCENARIO 2: LoRa Hardware Bridge (5km Multi-Cluster Relay) ---");
-    let (lora_net, bridge_a, bridge_b) = MeshSimulator::new_partitioned_with_lora_bridge(10);
-    println!("Cluster A (Nodes 0..9) <--- LoRa 915MHz Bridge (Node {} <-> Node {}) ---> Cluster B (Nodes 10..19)", bridge_a, bridge_b);
-    let (reached_2, tx_2) = lora_net.run_sos_simulation(0, "CRITICAL SOS: Flood level rising in Cluster A");
-    println!("Total Nodes: 20");
-    println!("Nodes Reached: {} / 20 ({:.1}%)", reached_2, (reached_2 as f32 / 20.0) * 100.0);
+    let (lora_net, bridge_a, bridge_b) =
+        MeshSimulator::new_partitioned_with_lora_bridge(CLUSTER);
+    println!(
+        "Cluster A (Nodes 0..{}) <--- LoRa 915MHz Bridge (Node {} <-> Node {}) ---> Cluster B (Nodes {}..{})",
+        CLUSTER - 1,
+        bridge_a,
+        bridge_b,
+        CLUSTER,
+        total_2 - 1
+    );
+    let (reached_2, tx_2) =
+        lora_net.run_sos_simulation(0, "CRITICAL SOS: Flood level rising in Cluster A");
+    println!("Total Nodes: {}", total_2);
+    println!(
+        "Nodes Reached: {} / {} ({:.1}%)",
+        reached_2,
+        total_2,
+        (reached_2 as f32 / total_2 as f32) * 100.0
+    );
     println!("Total Transmissions (Including LoRa Frame Bridge): {}", tx_2);
+    println!(
+        "Note: TTL {} caps a line topology at ~{} hops from the origin.",
+        meshline_core::DEFAULT_TTL,
+        meshline_core::DEFAULT_TTL - 1
+    );
+
+    // Scenario 3: Low-power duty cycling must still carry SOS to everyone.
+    println!("\n--- SCENARIO 3: 49-Node Grid on Low-Power Duty Cycle ---");
+    let mut low_power_net = MeshSimulator::new_grid(7);
+    low_power_net.set_battery_state_all(BatteryPowerState::LowPowerSaver);
+    let (reached_3, tx_3) = low_power_net.run_sos_simulation(24, "SOS! Battery saver active");
+    println!("Nodes Reached: {} / 49 ({:.1}%)", reached_3, (reached_3 as f32 / 49.0) * 100.0);
+    println!("Total Packet Transmissions: {}", tx_3);
+
+    // Scenario 4: forged traffic must not propagate at all.
+    println!("\n--- SCENARIO 4: Forged SOS Injection (49 nodes) ---");
+    let adversarial_net = MeshSimulator::new_grid(7);
+    let (accepted, rejected) = adversarial_net.run_forgery_simulation(24);
+    println!("Forged packets accepted: {accepted}");
+    println!("Forged packets rejected: {rejected}");
+
+    // These are the properties the mesh is supposed to guarantee. Assert them
+    // rather than printing a banner that says "PASSED" regardless of outcome.
+    let mut failures = Vec::new();
+    if reached_1 < 49 {
+        failures.push(format!("grid SOS reached only {reached_1}/49 nodes"));
+    }
+    if reached_2 < total_2 {
+        failures.push(format!(
+            "LoRa-bridged SOS reached only {reached_2}/{total_2} nodes; the bridge did not carry it"
+        ));
+    }
+    if reached_3 < 49 {
+        failures.push(format!(
+            "low-power SOS reached only {reached_3}/49 nodes; SOS must bypass dampening"
+        ));
+    }
+    if accepted > 0 {
+        failures.push(format!("{accepted} nodes accepted a forged SOS"));
+    }
 
     println!("\n============================================================");
-    println!("                  ALL SIMULATIONS PASSED                    ");
-    println!("============================================================");
+    if failures.is_empty() {
+        println!("            ALL SIMULATION ASSERTIONS PASSED               ");
+        println!("============================================================");
+    } else {
+        println!("                 SIMULATION FAILURES                       ");
+        for f in &failures {
+            println!("  - {f}");
+        }
+        println!("============================================================");
+        std::process::exit(1);
+    }
 }

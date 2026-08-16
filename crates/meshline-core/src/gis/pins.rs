@@ -62,15 +62,14 @@ impl ResourcePin {
     }
 }
 
+#[derive(Default)]
 pub struct GisPinStore {
     pins: Mutex<HashMap<[u8; 16], ResourcePin>>,
 }
 
 impl GisPinStore {
     pub fn new() -> Self {
-        Self {
-            pins: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub fn upsert_pin(&self, pin: ResourcePin, current_time: u64) -> Result<(), PinError> {

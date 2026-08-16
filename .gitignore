@@ -1,6 +1,5 @@
 # Rust build target
 /target/
-/.cargo/
 
 # Android build outputs
 android/.gradle/
@@ -9,7 +8,17 @@ android/app/build/
 android/local.properties
 android/.idea/
 android/*.iml
+
+# Native libraries are build outputs written to android/app/build/rustJniLibs/
+# by the cargo-ndk Gradle task, so they are already covered by android/app/build/.
+# This stale path is kept ignored so an old working copy does not commit one.
 android/app/src/main/jniLibs/
+
+# Release signing material. Never commit these — a leaked upload key lets
+# anyone publish an update to your listing.
+android/keystore.properties
+*.jks
+*.keystore
 
 # OS and IDE temporary files
 .DS_Store

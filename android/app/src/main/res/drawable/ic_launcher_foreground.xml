@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MeshLine mark: a central node broadcasting outward through two relay arcs.
+  Drawn inside the 72dp adaptive-icon safe zone of the 108dp canvas.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer relay arc -->
+    <path
+        android:pathData="M 30,72 A 30,30 0 0 1 30,36"
+        android:strokeColor="#FF3B30"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M 78,36 A 30,30 0 0 1 78,72"
+        android:strokeColor="#FF3B30"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- Inner relay arc -->
+    <path
+        android:pathData="M 42,64 A 16,16 0 0 1 42,44"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M 66,44 A 16,16 0 0 1 66,64"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- Origin node -->
+    <path
+        android:pathData="M 54,46 A 8,8 0 1 1 53.99,46 Z"
+        android:fillColor="#F0F4F8" />
+</vector>

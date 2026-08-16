@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MeshLine</string>
+
+    <!-- Foreground relay service -->
+    <string name="relay_channel_name">Mesh relay</string>
+    <string name="relay_channel_description">Shows that this device is relaying messages for the offline mesh.</string>
+    <string name="relay_notification_title">MeshLine relay active</string>
+    <string name="relay_notification_starting">Starting…</string>
+    <string name="relay_notification_active">Carrying messages for nearby devices.</string>
+    <string name="relay_notification_stop">Stop</string>
+    <string name="relay_notification_core_failed">Secure core unavailable — relay stopped.</string>
+    <string name="relay_notification_needs_permission">Waiting for nearby device permissions.</string>
+    <string name="relay_notification_no_transport">No radio available for the mesh.</string>
+
+    <plurals name="relay_notification_peers">
+        <item quantity="zero">No devices in range. Still listening.</item>
+        <item quantity="one">Relaying with %d device in range.</item>
+        <item quantity="other">Relaying with %d devices in range.</item>
+    </plurals>
+</resources>

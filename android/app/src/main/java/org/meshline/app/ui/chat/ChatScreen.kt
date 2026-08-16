@@ -20,45 +20,46 @@ import androidx.compose.ui.unit.sp
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
+import org.meshline.app.bridge.MeshCoreBridge
 import org.meshline.app.db.MessageEntity
+import org.meshline.app.db.MessageStatus
+import org.meshline.app.db.PeerNodeEntity
 import org.meshline.app.db.StoreAndForwardManager
 import org.meshline.app.ui.theme.*
 
-data class ChatMessage(
-    val id: String,
-    val sender: String,
-    val text: String,
-    val timestamp: String,
-    val isMe: Boolean,
-    val status: String,
-    val hopCount: Int
-)
-
-private fun formatTimestamp(millis: Long): String {
-    val sdf = SimpleDateFormat("h:mm a", Locale.getDefault())
-    return sdf.format(Date(millis))
-}
+private fun formatTimestamp(millis: Long): String =
+    SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(millis))
 
 @Composable
 fun ChatScreen() {
     val context = LocalContext.current
-    val storeAndForward = remember { StoreAndForwardManager.getInstance(context) }
-    val dbMessages by storeAndForward.messagesFlow.collectAsState()
-    var selectedChannel by remember { mutableIntStateOf(0) } // 0 = Broadcast, 1 = Field Rescue, 2 = Family Circle
-    
-    val messages = dbMessages.map { entity ->
-        ChatMessage(
-            id = entity.msgId,
-            sender = entity.senderId,
-            text = entity.payloadText,
-            timestamp = formatTimestamp(entity.timestamp),
-            isMe = entity.senderId == "Me",
-            status = entity.status,
-            hopCount = (8 - entity.ttl).coerceAtLeast(1)
-        )
-    }
+    val store = remember { StoreAndForwardManager.getInstance(context) }
+    val messages by store.messagesFlow.collectAsState()
+    val peers by store.peersFlow.collectAsState()
+
+    // null means the public broadcast channel; otherwise a specific peer.
+    var selectedPeer by remember { mutableStateOf<PeerNodeEntity?>(null) }
     var inputText by remember { mutableStateOf("") }
+    var notice by remember { mutableStateOf<String?>(null) }
+
+    // Drop the selection if the peer goes out of range.
+    LaunchedEffect(peers) {
+        selectedPeer?.let { current ->
+            selectedPeer = peers.firstOrNull { it.nodeId == current.nodeId }
+        }
+    }
+
+    val visibleMessages = remember(messages, selectedPeer) {
+        val peer = selectedPeer
+        if (peer == null) {
+            messages.filter { it.recipientId == MessageEntity.BROADCAST_RECIPIENT }
+        } else {
+            messages.filter {
+                it.senderId == peer.nodeId ||
+                    (it.isOutgoing && it.recipientId == peer.nodeId)
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -66,7 +67,6 @@ fun ChatScreen() {
             .background(ObsidianBackground)
             .padding(16.dp)
     ) {
-        // Header & Encryption Security Badge
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -80,9 +80,19 @@ fun ChatScreen() {
                     color = TextPrimary
                 )
                 Text(
-                    text = "Serverless Noise-XX Double Ratchet E2EE",
+                    text = selectedPeer?.let {
+                        if (it.hasSecureSession) {
+                            "End-to-end encrypted (Noise-XX)"
+                        } else {
+                            "Not yet encrypted — set up a secure link first"
+                        }
+                    } ?: "Public channel — anyone in range can read this",
                     fontSize = 11.sp,
-                    color = TextMuted
+                    color = when {
+                        selectedPeer == null -> SafetyAmber
+                        selectedPeer?.hasSecureSession == true -> EmergencyGreen
+                        else -> SafetyAmber
+                    }
                 )
             }
 
@@ -95,111 +105,246 @@ fun ChatScreen() {
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Surface(color = EmergencyGreen, shape = CircleShape, modifier = Modifier.size(6.dp)) {}
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = if (peers.isEmpty()) TextMuted else EmergencyGreen,
+                        shape = CircleShape,
+                        modifier = Modifier.size(6.dp)
+                    ) {}
+                    Spacer(Modifier.width(6.dp))
                     Text(
-                        text = "3 Hops Active",
+                        text = if (peers.isEmpty()) "No peers" else "${peers.size} in range",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
-                        color = EmergencyGreen
+                        color = if (peers.isEmpty()) TextMuted else EmergencyGreen
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(Modifier.height(12.dp))
 
-        // Channel Selector Pill Bar
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            val channels = listOf("🌐 Open Mesh", "🚑 Field Rescue", "🏠 Family Circle")
-            channels.forEachIndexed { index, name ->
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .background(
-                            if (selectedChannel == index) NeonCyan else GlassSurfaceCard,
-                            shape = RoundedCornerShape(12.dp)
-                        )
-                        .clickable { selectedChannel = index }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = name,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (selectedChannel == index) Color.Black else TextPrimary
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Message List Thread
+        // Channel selector: the public channel, plus one entry per real peer.
+        // No invented groups — a channel that does not exist cannot carry a message.
         LazyColumn(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.heightIn(max = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(messages) { msg ->
-                ChatBubble(msg)
+            item {
+                ChannelChip(
+                    label = "Public channel",
+                    subtitle = "Unencrypted, readable by anyone nearby",
+                    selected = selectedPeer == null,
+                    accent = SafetyAmber,
+                    onClick = { selectedPeer = null; notice = null }
+                )
+            }
+            items(peers, key = { it.nodeId }) { peer ->
+                ChannelChip(
+                    label = peer.displayName,
+                    subtitle = if (peer.hasSecureSession) {
+                        "Encrypted • ${peer.transport}"
+                    } else {
+                        "Tap to set up encryption • ${peer.transport}"
+                    },
+                    selected = selectedPeer?.nodeId == peer.nodeId,
+                    accent = if (peer.hasSecureSession) EmergencyGreen else NeonCyan,
+                    onClick = { selectedPeer = peer; notice = null }
+                )
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(Modifier.height(12.dp))
 
-        // Message Input Dock
-        Card(
-            colors = CardDefaults.cardColors(containerColor = GlassSurfaceCard),
-            shape = RoundedCornerShape(24.dp),
-            border = BorderStroke(1.dp, GlassSurfaceBorder),
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        Box(modifier = Modifier.weight(1f)) {
+            if (visibleMessages.isEmpty()) {
+                EmptyState(
+                    text = if (peers.isEmpty()) {
+                        "No devices in range yet.\nMeshLine keeps looking in the background."
+                    } else {
+                        "No messages here yet."
+                    }
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(visibleMessages, key = { it.msgId }) { message ->
+                        MessageBubble(message)
+                    }
+                }
+            }
+        }
+
+        notice?.let {
+            Text(
+                text = it,
+                fontSize = 11.sp,
+                color = SafetyAmber,
+                modifier = Modifier.padding(vertical = 6.dp)
+            )
+        }
+
+        val peer = selectedPeer
+        val needsHandshake = peer != null && !peer.hasSecureSession
+
+        if (needsHandshake) {
+            Button(
+                onClick = {
+                    notice = if (store.startHandshake(peer.nodeId)) {
+                        "Setting up an encrypted link with ${peer.displayName}…"
+                    } else {
+                        "Could not start the secure link. Stay in range and try again."
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
+            ) {
+                Text("Set up encrypted link", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        } else {
             Row(
-                modifier = Modifier
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                    .fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { inputText = it },
-                    placeholder = { Text("Send peer-to-peer message...", color = TextMuted, fontSize = 13.sp) },
+                    onValueChange = { if (it.length <= 500) inputText = it },
                     modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message", color = TextMuted) },
+                    shape = RoundedCornerShape(24.dp),
+                    maxLines = 3,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color.Transparent,
-                        unfocusedBorderColor = Color.Transparent,
+                        focusedBorderColor = NeonCyan,
+                        unfocusedBorderColor = GlassSurfaceBorder,
+                        focusedContainerColor = GlassSurfaceCard,
+                        unfocusedContainerColor = GlassSurfaceCard,
                         focusedTextColor = TextPrimary,
                         unfocusedTextColor = TextPrimary
                     )
                 )
 
-                Button(
+                val canSend = MeshCoreBridge.isReady() && inputText.isNotBlank() && peer != null
+
+                FilledIconButton(
                     onClick = {
-                        if (inputText.isNotBlank()) {
-                            val newMsg = MessageEntity(
-                                msgId = UUID.randomUUID().toString(),
-                                senderId = "Me",
-                                recipientId = "All",
-                                payloadText = inputText,
-                                ttl = 8,
-                                timestamp = System.currentTimeMillis(),
-                                packetType = "Chat",
-                                status = "QUEUED"
-                            )
-                            storeAndForward.queueMessage(newMsg)
+                        val target = peer ?: return@FilledIconButton
+                        val sent = store.sendChat(target.nodeId, inputText)
+                        notice = if (sent) {
                             inputText = ""
+                            null
+                        } else {
+                            "Message not sent: the encrypted link is not ready."
                         }
                     },
-                    shape = CircleShape,
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
-                    modifier = Modifier.size(44.dp),
-                    contentPadding = PaddingValues(0.dp)
+                    enabled = canSend,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = NeonCyan,
+                        disabledContainerColor = GlassSurfaceBorder
+                    )
                 ) {
-                    Text("➔", color = Color.Black, fontSize = 18.sp, fontWeight = FontWeight.Black)
+                    Text("→", fontSize = 18.sp, color = Color.Black, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (peer == null) {
+                Text(
+                    text = "Select a device above to send an encrypted message. " +
+                        "Use the SOS tab to reach everyone in range.",
+                    fontSize = 10.sp,
+                    color = TextMuted,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelChip(
+    label: String,
+    subtitle: String,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        color = if (selected) accent.copy(alpha = 0.18f) else GlassSurfaceCard,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (selected) accent else GlassSurfaceBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Text(
+                label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (selected) accent else TextPrimary
+            )
+            Text(subtitle, fontSize = 10.sp, color = TextMuted)
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(message: MessageEntity) {
+    val isMe = message.isOutgoing
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isMe) Arrangement.End else Arrangement.Start
+    ) {
+        Surface(
+            color = if (isMe) NeonCyan.copy(alpha = 0.16f) else GlassSurfaceCard,
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, if (isMe) NeonCyan else GlassSurfaceBorder),
+            modifier = Modifier.widthIn(max = 280.dp)
+        ) {
+            Column(modifier = Modifier.padding(10.dp)) {
+                if (!isMe) {
+                    Text(
+                        text = message.senderId.take(10),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonCyan
+                    )
+                    Spacer(Modifier.height(2.dp))
+                }
+                Text(message.payloadText, fontSize = 13.sp, color = TextPrimary)
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        formatTimestamp(message.timestampMillis),
+                        fontSize = 9.sp,
+                        color = TextMuted
+                    )
+                    Text(
+                        if (message.encrypted) "encrypted" else "public",
+                        fontSize = 9.sp,
+                        color = if (message.encrypted) EmergencyGreen else SafetyAmber
+                    )
+                    if (isMe) {
+                        Text(
+                            when (message.status) {
+                                MessageStatus.QUEUED -> "waiting for a peer"
+                                MessageStatus.SENT -> "relayed"
+                                MessageStatus.DELIVERED -> "delivered"
+                                MessageStatus.FAILED -> "not sent"
+                            },
+                            fontSize = 9.sp,
+                            color = when (message.status) {
+                                MessageStatus.DELIVERED -> EmergencyGreen
+                                MessageStatus.FAILED -> SignalRed
+                                else -> TextMuted
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -207,63 +352,13 @@ fun ChatScreen() {
 }
 
 @Composable
-fun ChatBubble(message: ChatMessage) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = if (message.isMe) Alignment.End else Alignment.Start
-    ) {
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = if (message.isMe) Color(0xFF003847) else GlassSurfaceCard
-            ),
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (message.isMe) 16.dp else 4.dp,
-                bottomEnd = if (message.isMe) 4.dp else 16.dp
-            ),
-            border = BorderStroke(1.dp, if (message.isMe) NeonCyan.copy(alpha = 0.4f) else GlassSurfaceBorder)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                if (!message.isMe) {
-                    Text(
-                        text = message.sender,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = SafetyAmber
-                    )
-                    Spacer(modifier = Modifier.height(2.dp))
-                }
-                Text(
-                    text = message.text,
-                    fontSize = 14.sp,
-                    color = TextPrimary
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = message.timestamp,
-                        fontSize = 10.sp,
-                        color = TextMuted
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Surface(
-                        color = Color(0xFF1E242F),
-                        shape = RoundedCornerShape(6.dp)
-                    ) {
-                        Text(
-                            text = "🔗 ${message.status}",
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = EmergencyGreen,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-            }
-        }
+private fun EmptyState(text: String) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            text = text,
+            fontSize = 12.sp,
+            color = TextMuted,
+            lineHeight = 18.sp
+        )
     }
 }

@@ -1,106 +1,586 @@
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Nonce,
-};
-use hkdf::Hkdf;
-use rand::rngs::OsRng;
-use sha2::Sha256;
+//! Authenticated session establishment for MeshLine.
+//!
+//! This is a real Noise_XX handshake driven by the `snow` crate rather than a
+//! hand-rolled Diffie-Hellman ladder. Noise gives us mutual authentication,
+//! forward secrecy, and a hashed transcript that binds every handshake message.
+//!
+//! Noise on its own authenticates the *Noise static key*, which says nothing
+//! about which mesh node you are talking to. We close that gap by carrying an
+//! [`IdentityProof`] in the handshake payload: each side signs its own Noise
+//! static public key with its long-lived Ed25519 mesh identity. A peer is only
+//! accepted once that signature checks out, which is what ties a live session to
+//! the `sender_id` seen on signed broadcast packets.
+
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use snow::{Builder, HandshakeState, StatelessTransportState};
+use std::collections::HashMap;
 use thiserror::Error;
-use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
+
+use crate::packet::schema::node_id_from_pubkey;
+
+/// Noise pattern. XX is the right choice here: neither side knows the other's
+/// static key in advance, which is exactly the situation for strangers meeting
+/// over a disaster mesh.
+pub const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+
+/// Domain separator for the identity binding signature, so a signature minted
+/// here can never be replayed as a packet signature.
+const BINDING_CONTEXT: &[u8] = b"meshline/noise-identity-binding/v2";
+
+/// Ed25519 public key (32) + signature over the bound Noise static key (64).
+pub const IDENTITY_PROOF_LEN: usize = 96;
+
+/// Largest handshake or transport message we will process.
+pub const MAX_NOISE_MESSAGE: usize = 4096;
+
+/// How far a received nonce may lag the highest one seen before we treat it as
+/// a replay. A mesh reorders and duplicates freely, so some slack is required.
+pub const REPLAY_WINDOW: u64 = 512;
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
-    #[error("Encryption failed")]
-    EncryptionFailed,
-    #[error("Decryption failed")]
-    DecryptionFailed,
-    #[error("Handshake state invalid")]
-    InvalidHandshakeState,
-    #[error("Key derivation failed")]
-    KeyDerivationFailed,
+    #[error("Noise protocol failure: {0}")]
+    Noise(String),
+    #[error("Handshake is not finished")]
+    HandshakeIncomplete,
+    #[error("Handshake already finished")]
+    HandshakeAlreadyComplete,
+    #[error("Peer identity proof was missing or malformed")]
+    MalformedIdentityProof,
+    #[error("Peer identity proof failed verification")]
+    UnauthenticatedPeer,
+    #[error("Message exceeds maximum Noise message size")]
+    MessageTooLarge,
+    #[error("Replayed or out-of-window nonce")]
+    ReplayedNonce,
+    #[error("No established session with peer")]
+    NoSession,
 }
 
-pub struct SymmetricCipher;
-
-impl SymmetricCipher {
-    pub fn encrypt(key: &[u8; 32], nonce_counter: u64, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::EncryptionFailed)?;
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&nonce_counter.to_le_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        cipher.encrypt(nonce, plaintext).map_err(|_| CryptoError::EncryptionFailed)
-    }
-
-    pub fn decrypt(key: &[u8; 32], nonce_counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::DecryptionFailed)?;
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&nonce_counter.to_le_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        cipher.decrypt(nonce, ciphertext).map_err(|_| CryptoError::DecryptionFailed)
-    }
+/// Proof that the holder of a mesh identity key also holds a given Noise static
+/// key. Serialized as a fixed 96-byte blob and carried in the handshake payload.
+#[derive(Debug, Clone)]
+pub struct IdentityProof {
+    pub identity_pubkey: [u8; 32],
+    pub signature: [u8; 64],
 }
 
-pub struct NoiseHandshakeState {
-    pub local_static_secret: StaticSecret,
-    pub local_static_public: XPublicKey,
-    pub remote_static_public: Option<XPublicKey>,
-    pub shared_session_key: Option<[u8; 32]>,
-}
-
-impl NoiseHandshakeState {
-    pub fn new() -> Self {
-        let static_secret = StaticSecret::random_from_rng(OsRng);
-        let static_public = XPublicKey::from(&static_secret);
+impl IdentityProof {
+    /// Signs `noise_static_pub` with the node's long-lived identity key.
+    pub fn create(signing_key: &SigningKey, noise_static_pub: &[u8]) -> Self {
+        let signature = signing_key.sign(&binding_message(noise_static_pub));
         Self {
-            local_static_secret: static_secret,
-            local_static_public: static_public,
-            remote_static_public: None,
-            shared_session_key: None,
+            identity_pubkey: signing_key.verifying_key().to_bytes(),
+            signature: signature.to_bytes(),
         }
     }
 
-    pub fn initiate(&mut self) -> ([u8; 32], EphemeralSecret) {
-        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-        let ephemeral_public = XPublicKey::from(&ephemeral_secret);
-        (*ephemeral_public.as_bytes(), ephemeral_secret)
+    pub fn to_bytes(&self) -> [u8; IDENTITY_PROOF_LEN] {
+        let mut out = [0u8; IDENTITY_PROOF_LEN];
+        out[..32].copy_from_slice(&self.identity_pubkey);
+        out[32..].copy_from_slice(&self.signature);
+        out
     }
 
-    pub fn respond(
-        &mut self,
-        initiator_ephemeral_bytes: &[u8; 32],
-    ) -> Result<([u8; 32], [u8; 32]), CryptoError> {
-        let initiator_ephemeral = XPublicKey::from(*initiator_ephemeral_bytes);
-        let responder_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-        let responder_ephemeral_public = XPublicKey::from(&responder_ephemeral_secret);
-
-        let shared_ee = responder_ephemeral_secret.diffie_hellman(&initiator_ephemeral);
-        let shared_es = self.local_static_secret.diffie_hellman(&initiator_ephemeral);
-
-        let hk = Hkdf::<Sha256>::new(None, shared_ee.as_bytes());
-        let mut session_key = [0u8; 32];
-        hk.expand(shared_es.as_bytes(), &mut session_key)
-            .map_err(|_| CryptoError::KeyDerivationFailed)?;
-
-        self.shared_session_key = Some(session_key);
-        Ok((*responder_ephemeral_public.as_bytes(), session_key))
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.len() != IDENTITY_PROOF_LEN {
+            return Err(CryptoError::MalformedIdentityProof);
+        }
+        let mut identity_pubkey = [0u8; 32];
+        let mut signature = [0u8; 64];
+        identity_pubkey.copy_from_slice(&bytes[..32]);
+        signature.copy_from_slice(&bytes[32..]);
+        Ok(Self {
+            identity_pubkey,
+            signature,
+        })
     }
 
-    pub fn finalize(
+    /// Checks the proof against the Noise static key the handshake actually
+    /// authenticated. Passing the remote static from `snow` (rather than one
+    /// the peer claims) is what makes this binding meaningful.
+    pub fn verify(&self, authenticated_noise_static: &[u8]) -> Result<(), CryptoError> {
+        let vk = VerifyingKey::from_bytes(&self.identity_pubkey)
+            .map_err(|_| CryptoError::UnauthenticatedPeer)?;
+        let sig = Signature::from_bytes(&self.signature);
+        vk.verify_strict(&binding_message(authenticated_noise_static), &sig)
+            .map_err(|_| CryptoError::UnauthenticatedPeer)
+    }
+
+    pub fn node_id(&self) -> [u8; 16] {
+        node_id_from_pubkey(&self.identity_pubkey)
+    }
+}
+
+fn binding_message(noise_static_pub: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(BINDING_CONTEXT.len() + noise_static_pub.len());
+    msg.extend_from_slice(BINDING_CONTEXT);
+    msg.extend_from_slice(noise_static_pub);
+    msg
+}
+
+/// An in-progress Noise_XX handshake.
+///
+/// XX is three messages: `-> e`, `<- e, ee, s, es`, `-> s, se`. Drive it by
+/// alternating [`write_message`](Self::write_message) and
+/// [`read_message`](Self::read_message) until [`is_finished`](Self::is_finished),
+/// then call [`into_transport`](Self::into_transport).
+pub struct HandshakeSession {
+    state: Option<HandshakeState>,
+    is_initiator: bool,
+    identity_proof: [u8; IDENTITY_PROOF_LEN],
+    peer_identity: Option<[u8; 32]>,
+    writes_done: usize,
+}
+
+impl HandshakeSession {
+    pub fn new(signing_key: &SigningKey, is_initiator: bool) -> Result<Self, CryptoError> {
+        let params = NOISE_PARAMS
+            .parse()
+            .map_err(|e: snow::Error| CryptoError::Noise(e.to_string()))?;
+        let builder = Builder::new(params);
+        let keypair = builder
+            .generate_keypair()
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+        let proof = IdentityProof::create(signing_key, &keypair.public).to_bytes();
+
+        let builder = Builder::new(
+            NOISE_PARAMS
+                .parse()
+                .map_err(|e: snow::Error| CryptoError::Noise(e.to_string()))?,
+        )
+        .local_private_key(&keypair.private);
+
+        let state = if is_initiator {
+            builder.build_initiator()
+        } else {
+            builder.build_responder()
+        }
+        .map_err(|e| CryptoError::Noise(e.to_string()))?;
+
+        Ok(Self {
+            state: Some(state),
+            is_initiator,
+            identity_proof: proof,
+            peer_identity: None,
+            writes_done: 0,
+        })
+    }
+
+    pub fn initiator(signing_key: &SigningKey) -> Result<Self, CryptoError> {
+        Self::new(signing_key, true)
+    }
+
+    pub fn responder(signing_key: &SigningKey) -> Result<Self, CryptoError> {
+        Self::new(signing_key, false)
+    }
+
+    pub fn is_initiator(&self) -> bool {
+        self.is_initiator
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.state
+            .as_ref()
+            .map(|s| s.is_handshake_finished())
+            .unwrap_or(false)
+    }
+
+    /// Produces the next handshake message, carrying our identity proof as the
+    /// Noise payload. In XX the payload is only encrypted from message 2
+    /// onward; message 1 carries none, which is why we skip it there.
+    pub fn write_message(&mut self) -> Result<Vec<u8>, CryptoError> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(CryptoError::HandshakeAlreadyComplete)?;
+
+        // The initiator's first message (`-> e`) has no key material yet, so an
+        // identity proof there would travel in the clear and announce to any
+        // listener exactly who is calling out. Every later message is encrypted.
+        let payload: &[u8] = if self.is_initiator && self.writes_done == 0 {
+            &[]
+        } else {
+            &self.identity_proof
+        };
+
+        let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
+        let len = state
+            .write_message(payload, &mut buf)
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+        buf.truncate(len);
+        self.writes_done += 1;
+        Ok(buf)
+    }
+
+    /// Consumes a handshake message from the peer, verifying the identity proof
+    /// as soon as one is present.
+    pub fn read_message(&mut self, message: &[u8]) -> Result<(), CryptoError> {
+        if message.len() > MAX_NOISE_MESSAGE {
+            return Err(CryptoError::MessageTooLarge);
+        }
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(CryptoError::HandshakeAlreadyComplete)?;
+
+        let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
+        let len = state
+            .read_message(message, &mut buf)
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+        buf.truncate(len);
+
+        if !buf.is_empty() {
+            let proof = IdentityProof::from_bytes(&buf)?;
+            let remote_static = state
+                .get_remote_static()
+                .ok_or(CryptoError::UnauthenticatedPeer)?;
+            proof.verify(remote_static)?;
+            self.peer_identity = Some(proof.identity_pubkey);
+        }
+        Ok(())
+    }
+
+    /// Finishes the handshake. Fails closed if the peer never presented a
+    /// verified identity proof, so an anonymous session can never be used.
+    pub fn into_transport(mut self) -> Result<TransportSession, CryptoError> {
+        let state = self.state.take().ok_or(CryptoError::HandshakeIncomplete)?;
+        if !state.is_handshake_finished() {
+            return Err(CryptoError::HandshakeIncomplete);
+        }
+        let peer_identity = self.peer_identity.ok_or(CryptoError::UnauthenticatedPeer)?;
+        let transport = state
+            .into_stateless_transport_mode()
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+
+        Ok(TransportSession {
+            state: transport,
+            peer_identity_pubkey: peer_identity,
+            peer_node_id: node_id_from_pubkey(&peer_identity),
+            sending_nonce: 0,
+            highest_received_nonce: 0,
+            seen_nonces: Vec::new(),
+        })
+    }
+
+    pub fn peer_identity(&self) -> Option<[u8; 32]> {
+        self.peer_identity
+    }
+}
+
+/// An established, authenticated, bidirectional session.
+///
+/// Each ciphertext is prefixed with its explicit 8-byte nonce. A mesh delivers
+/// out of order and duplicates freely, so relying on `snow`'s implicit
+/// monotonic counter would drop legitimate traffic; the explicit nonce plus a
+/// sliding replay window handles both reordering and replay.
+pub struct TransportSession {
+    state: StatelessTransportState,
+    peer_identity_pubkey: [u8; 32],
+    peer_node_id: [u8; 16],
+    sending_nonce: u64,
+    highest_received_nonce: u64,
+    seen_nonces: Vec<u64>,
+}
+
+impl TransportSession {
+    pub fn peer_node_id(&self) -> [u8; 16] {
+        self.peer_node_id
+    }
+
+    pub fn peer_identity_pubkey(&self) -> [u8; 32] {
+        self.peer_identity_pubkey
+    }
+
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if plaintext.len() + 24 > MAX_NOISE_MESSAGE {
+            return Err(CryptoError::MessageTooLarge);
+        }
+        let nonce = self.sending_nonce;
+
+        let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
+        let len = self
+            .state
+            .write_message(nonce, plaintext, &mut buf)
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+        buf.truncate(len);
+
+        // Never reuse a nonce, even if a later step fails.
+        self.sending_nonce = self.sending_nonce.saturating_add(1);
+
+        let mut out = Vec::with_capacity(8 + buf.len());
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(&buf);
+        Ok(out)
+    }
+
+    pub fn decrypt(&mut self, framed: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if framed.len() < 8 || framed.len() > MAX_NOISE_MESSAGE {
+            return Err(CryptoError::MessageTooLarge);
+        }
+        let mut nonce_bytes = [0u8; 8];
+        nonce_bytes.copy_from_slice(&framed[..8]);
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        self.check_replay(nonce)?;
+
+        let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
+        let len = self
+            .state
+            .read_message(nonce, &framed[8..], &mut buf)
+            .map_err(|e| CryptoError::Noise(e.to_string()))?;
+        buf.truncate(len);
+
+        // Only record the nonce once the tag has actually verified, so a forged
+        // frame cannot burn a nonce the real peer still needs.
+        self.record_nonce(nonce);
+        Ok(buf)
+    }
+
+    fn check_replay(&self, nonce: u64) -> Result<(), CryptoError> {
+        if self.seen_nonces.contains(&nonce) {
+            return Err(CryptoError::ReplayedNonce);
+        }
+        if nonce + REPLAY_WINDOW < self.highest_received_nonce {
+            return Err(CryptoError::ReplayedNonce);
+        }
+        Ok(())
+    }
+
+    fn record_nonce(&mut self, nonce: u64) {
+        self.highest_received_nonce = self.highest_received_nonce.max(nonce);
+        self.seen_nonces.push(nonce);
+        let floor = self.highest_received_nonce.saturating_sub(REPLAY_WINDOW);
+        self.seen_nonces.retain(|n| *n >= floor);
+    }
+}
+
+/// Tracks handshakes and live sessions per peer.
+#[derive(Default)]
+pub struct SessionManager {
+    pending: HashMap<[u8; 16], HandshakeSession>,
+    established: HashMap<[u8; 16], TransportSession>,
+}
+
+impl SessionManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn has_session(&self, peer: &[u8; 16]) -> bool {
+        self.established.contains_key(peer)
+    }
+
+    pub fn established_peers(&self) -> Vec<[u8; 16]> {
+        self.established.keys().copied().collect()
+    }
+
+    /// Starts an outbound handshake, returning Noise message 1.
+    pub fn begin_handshake(
         &mut self,
-        initiator_ephemeral_secret: EphemeralSecret,
-        responder_ephemeral_bytes: &[u8; 32],
-    ) -> Result<[u8; 32], CryptoError> {
-        let responder_ephemeral = XPublicKey::from(*responder_ephemeral_bytes);
+        peer: [u8; 16],
+        signing_key: &SigningKey,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let mut session = HandshakeSession::initiator(signing_key)?;
+        let msg = session.write_message()?;
+        self.pending.insert(peer, session);
+        Ok(msg)
+    }
 
-        let shared_ee = initiator_ephemeral_secret.diffie_hellman(&responder_ephemeral);
-        let shared_se = self.local_static_secret.diffie_hellman(&responder_ephemeral);
+    /// Feeds an inbound handshake message, returning our reply if the pattern
+    /// calls for one. Promotes the session to established on completion.
+    pub fn accept_handshake(
+        &mut self,
+        peer: [u8; 16],
+        message: &[u8],
+        signing_key: &SigningKey,
+    ) -> Result<Option<Vec<u8>>, CryptoError> {
+        let mut session = match self.pending.remove(&peer) {
+            Some(s) => s,
+            None => HandshakeSession::responder(signing_key)?,
+        };
 
-        let hk = Hkdf::<Sha256>::new(None, shared_ee.as_bytes());
-        let mut session_key = [0u8; 32];
-        hk.expand(shared_se.as_bytes(), &mut session_key)
-            .map_err(|_| CryptoError::KeyDerivationFailed)?;
+        session.read_message(message)?;
 
-        self.shared_session_key = Some(session_key);
-        Ok(session_key)
+        if session.is_finished() {
+            self.promote(session)?;
+            return Ok(None);
+        }
+
+        let reply = session.write_message()?;
+
+        if session.is_finished() {
+            self.promote(session)?;
+        } else {
+            self.pending.insert(peer, session);
+        }
+        Ok(Some(reply))
+    }
+
+    /// Keys the established session by the *verified* peer identity rather than
+    /// the transport-supplied peer hint, so a lying transport cannot bind a
+    /// session to somebody else's node id.
+    fn promote(&mut self, session: HandshakeSession) -> Result<(), CryptoError> {
+        let transport = session.into_transport()?;
+        self.established.insert(transport.peer_node_id(), transport);
+        Ok(())
+    }
+
+    pub fn encrypt_for(&mut self, peer: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.established
+            .get_mut(peer)
+            .ok_or(CryptoError::NoSession)?
+            .encrypt(plaintext)
+    }
+
+    pub fn decrypt_from(&mut self, peer: &[u8; 16], framed: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.established
+            .get_mut(peer)
+            .ok_or(CryptoError::NoSession)?
+            .decrypt(framed)
+    }
+
+    pub fn drop_session(&mut self, peer: &[u8; 16]) {
+        self.pending.remove(peer);
+        self.established.remove(peer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    fn keypair() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    /// Drives the full XX exchange between two managers.
+    fn connect(
+        alice_key: &SigningKey,
+        bob_key: &SigningKey,
+    ) -> (SessionManager, SessionManager, [u8; 16], [u8; 16]) {
+        let alice_id = node_id_from_pubkey(&alice_key.verifying_key().to_bytes());
+        let bob_id = node_id_from_pubkey(&bob_key.verifying_key().to_bytes());
+
+        let mut alice = SessionManager::new();
+        let mut bob = SessionManager::new();
+
+        let msg1 = alice.begin_handshake(bob_id, alice_key).unwrap();
+        let msg2 = bob.accept_handshake(alice_id, &msg1, bob_key).unwrap().unwrap();
+        let msg3 = alice.accept_handshake(bob_id, &msg2, alice_key).unwrap().unwrap();
+        assert!(bob.accept_handshake(alice_id, &msg3, bob_key).unwrap().is_none());
+
+        (alice, bob, alice_id, bob_id)
+    }
+
+    #[test]
+    fn xx_handshake_establishes_both_directions() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let (mut alice, mut bob, alice_id, bob_id) = connect(&a_key, &b_key);
+
+        assert!(alice.has_session(&bob_id));
+        assert!(bob.has_session(&alice_id));
+
+        let ct = alice.encrypt_for(&bob_id, b"meet at the school gate").unwrap();
+        let pt = bob.decrypt_from(&alice_id, &ct).unwrap();
+        assert_eq!(pt, b"meet at the school gate");
+
+        let ct = bob.encrypt_for(&alice_id, b"on my way").unwrap();
+        let pt = alice.decrypt_from(&bob_id, &ct).unwrap();
+        assert_eq!(pt, b"on my way");
+    }
+
+    #[test]
+    fn ciphertext_does_not_leak_plaintext() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let (mut alice, _bob, _alice_id, bob_id) = connect(&a_key, &b_key);
+        let secret = b"trapped in basement 3";
+        let ct = alice.encrypt_for(&bob_id, secret).unwrap();
+        assert!(!ct.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn identity_is_bound_to_the_noise_static_key() {
+        let key = keypair();
+        let proof = IdentityProof::create(&key, &[9u8; 32]);
+        proof.verify(&[9u8; 32]).unwrap();
+        // Same proof replayed against a different Noise key must not verify.
+        assert!(matches!(
+            proof.verify(&[8u8; 32]),
+            Err(CryptoError::UnauthenticatedPeer)
+        ));
+    }
+
+    #[test]
+    fn proof_from_one_identity_cannot_be_reused_by_another() {
+        let (honest, attacker) = (keypair(), keypair());
+        let mut proof = IdentityProof::create(&honest, &[1u8; 32]);
+        proof.identity_pubkey = attacker.verifying_key().to_bytes();
+        assert!(proof.verify(&[1u8; 32]).is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let (mut alice, mut bob, alice_id, bob_id) = connect(&a_key, &b_key);
+        let mut ct = alice.encrypt_for(&bob_id, b"water at the depot").unwrap();
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+        assert!(bob.decrypt_from(&alice_id, &ct).is_err());
+    }
+
+    #[test]
+    fn replayed_message_is_rejected() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let (mut alice, mut bob, alice_id, bob_id) = connect(&a_key, &b_key);
+        let ct = alice.encrypt_for(&bob_id, b"send help").unwrap();
+        bob.decrypt_from(&alice_id, &ct).unwrap();
+        assert!(matches!(
+            bob.decrypt_from(&alice_id, &ct),
+            Err(CryptoError::ReplayedNonce)
+        ));
+    }
+
+    #[test]
+    fn out_of_order_delivery_still_decrypts() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let (mut alice, mut bob, alice_id, bob_id) = connect(&a_key, &b_key);
+        let first = alice.encrypt_for(&bob_id, b"first").unwrap();
+        let second = alice.encrypt_for(&bob_id, b"second").unwrap();
+        let third = alice.encrypt_for(&bob_id, b"third").unwrap();
+
+        assert_eq!(bob.decrypt_from(&alice_id, &third).unwrap(), b"third");
+        assert_eq!(bob.decrypt_from(&alice_id, &first).unwrap(), b"first");
+        assert_eq!(bob.decrypt_from(&alice_id, &second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn no_session_means_no_plaintext_fallback() {
+        let mut alice = SessionManager::new();
+        assert!(matches!(
+            alice.encrypt_for(&[0u8; 16], b"hello"),
+            Err(CryptoError::NoSession)
+        ));
+    }
+
+    #[test]
+    fn session_is_keyed_by_verified_identity_not_transport_hint() {
+        let (a_key, b_key) = (keypair(), keypair());
+        let alice_id = node_id_from_pubkey(&a_key.verifying_key().to_bytes());
+        let bob_id = node_id_from_pubkey(&b_key.verifying_key().to_bytes());
+
+        let mut alice = SessionManager::new();
+        let mut bob = SessionManager::new();
+
+        // Bob is told the peer is some bogus id; the session must still land
+        // under Alice's real, cryptographically verified node id.
+        let lie = [0xEE; 16];
+        let msg1 = alice.begin_handshake(bob_id, &a_key).unwrap();
+        let msg2 = bob.accept_handshake(lie, &msg1, &b_key).unwrap().unwrap();
+        let msg3 = alice.accept_handshake(bob_id, &msg2, &a_key).unwrap().unwrap();
+        bob.accept_handshake(lie, &msg3, &b_key).unwrap();
+
+        assert!(bob.has_session(&alice_id));
+        assert!(!bob.has_session(&lie));
     }
 }

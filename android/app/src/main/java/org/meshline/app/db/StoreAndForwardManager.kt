@@ -1,6 +1,9 @@
 package org.meshline.app.db
 
 import android.content.Context
+import android.util.Log
+import java.nio.ByteBuffer
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,23 +12,32 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import org.meshline.app.bridge.MeshCoreBridge
-import java.util.UUID
 
+/** A peer this device has actually heard from. */
 data class PeerNodeEntity(
     val nodeId: String,
-    val deviceModel: String,
+    val displayName: String,
     val rssiDbm: Int,
-    val hopDistance: Int,
-    val lastSeenSec: Int,
-    val transport: String
+    val lastSeenMillis: Long,
+    val transport: String,
+    val hasSecureSession: Boolean = false
 )
 
+/**
+ * Custody store for messages, pins, and peers.
+ *
+ * Everything in here originates from a packet the native core has already
+ * authenticated, or from the local user. Nothing is seeded, invented, or
+ * simulated: an emergency app that displays imaginary nearby responders or
+ * fabricated shelter locations is actively harmful, so the stores start empty
+ * and stay empty until real traffic arrives.
+ */
 class StoreAndForwardManager private constructor(private val context: Context) {
 
     private val messageStore = ConcurrentHashMap<String, MessageEntity>()
     private val pinStore = ConcurrentHashMap<String, ResourcePinEntity>()
     private val peerStore = ConcurrentHashMap<String, PeerNodeEntity>()
-    private val rawPacketsQueue = ConcurrentLinkedQueue<ByteArray>()
+    private val outboundQueue = ConcurrentLinkedQueue<ByteArray>()
 
     private val _messagesFlow = MutableStateFlow<List<MessageEntity>>(emptyList())
     val messagesFlow: StateFlow<List<MessageEntity>> = _messagesFlow.asStateFlow()
@@ -37,391 +49,351 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     val peersFlow: StateFlow<List<PeerNodeEntity>> = _peersFlow.asStateFlow()
 
     companion object {
+        private const val TAG = "MeshStore"
+
+        /** Peers unheard from for this long stop being shown as in range. */
+        private const val PEER_STALE_MILLIS = 5 * 60 * 1000L
+
         @Volatile
         private var INSTANCE: StoreAndForwardManager? = null
 
-        fun getInstance(context: Context): StoreAndForwardManager {
-            return INSTANCE ?: synchronized(this) {
-                val instance = StoreAndForwardManager(context.applicationContext)
-                INSTANCE = instance
-                instance
+        fun getInstance(context: Context): StoreAndForwardManager =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: StoreAndForwardManager(context.applicationContext)
+                    .also { INSTANCE = it }
             }
-        }
     }
 
-    init {
-        if (MeshCoreBridge.isNativeReady()) {
-            // Seed native store with some sample pins
-            val samplePinsToSeed = listOf(
-                Triple("pin_1_water_pmp", 1, "Clean Water Filtration Pump"),
-                Triple("pin_2_shelter_c", 2, "Community Shelter (Gen Available)"),
-                Triple("pin_3_medical_t", 3, "First Aid Kit & Triage"),
-                Triple("pin_4_hazard_br", 4, "Collapsed Bridge / Roadblock")
-            )
-            for (item in samplePinsToSeed) {
-                val pinIdBytes = ByteArray(16)
-                val uuid = UUID.nameUUIDFromBytes(item.first.toByteArray())
-                val buffer = java.nio.ByteBuffer.wrap(pinIdBytes)
-                buffer.putLong(uuid.mostSignificantBits)
-                buffer.putLong(uuid.leastSignificantBits)
-                MeshCoreBridge.createSignedPinPacketSafe(
-                    pinIdBytes,
-                    item.second,
-                    37.7749f + (Math.random() - 0.5).toFloat() * 0.01f,
-                    -122.4194f + (Math.random() - 0.5).toFloat() * 0.01f,
-                    item.third,
-                    86400
-                )
-            }
-            syncResourcePins()
-        } else {
-            // Pre-populate with initial crisis resource pins in Kotlin memory fallback
-            val samplePins = listOf(
-                ResourcePinEntity("pin_1", "WaterPoint", 37.7749f, -122.4194f, "Clean Water Filtration Pump", System.currentTimeMillis(), System.currentTimeMillis() + 64800000, "pubkey_01", "sig_01", 5),
-                ResourcePinEntity("pin_2", "Shelter", 37.7780f, -122.4220f, "Community Shelter (Gen Available)", System.currentTimeMillis(), System.currentTimeMillis() + 151200000, "pubkey_02", "sig_02", 12),
-                ResourcePinEntity("pin_3", "MedicalStation", 37.7710f, -122.4150f, "First Aid Kit & Triage", System.currentTimeMillis(), System.currentTimeMillis() + 21600000, "pubkey_03", "sig_03", 3),
-                ResourcePinEntity("pin_4", "Hazard", 37.7760f, -122.4120f, "Collapsed Bridge / Roadblock", System.currentTimeMillis(), System.currentTimeMillis() + 86400000, "pubkey_04", "sig_04", 8)
-            )
-            samplePins.forEach { pinStore[it.pinId] = it }
-            _pinsFlow.value = pinStore.values.toList().sortedBy { it.createdAt }
+    // -----------------------------------------------------------------------
+    // Outbound
+    // -----------------------------------------------------------------------
+
+    /**
+     * Builds, records, and queues a public SOS.
+     * Returns false when the core is unavailable, in which case nothing is
+     * queued and the caller must tell the user the SOS did not send.
+     */
+    fun sendSos(text: String, latitude: Float, longitude: Float): Boolean {
+        val packet = MeshCoreBridge.createSos(text, latitude, longitude)
+        if (packet == null) {
+            Log.e(TAG, "SOS could not be created; mesh core unavailable.")
+            recordLocalMessage(text, "PublicSos", MessageStatus.FAILED)
+            return false
         }
-
-        // Pre-populate with sample messages for active chat visualization
-        val sampleMessages = listOf(
-            MessageEntity("msg_1", "Rescue Commander #4a19", "All", "All teams check in. Sector 3 bridge is reported flooded.", 8, System.currentTimeMillis() - 600000, "Chat", "RELAYED ACK"),
-            MessageEntity("msg_2", "Me", "All", "Unit 2 at Community Center shelter. 6 medical kits & clean water available.", 8, System.currentTimeMillis() - 300000, "Chat", "Delivered (1 hop)"),
-            MessageEntity("msg_3", "Node #8fa2", "All", "Confirmed water filtration pump operational at latitude 37.7749", 8, System.currentTimeMillis() - 100000, "Chat", "Relayed ACK")
-        )
-        sampleMessages.forEach { messageStore[it.msgId] = it }
-        _messagesFlow.value = messageStore.values.toList().sortedBy { it.timestamp }
-
-        // Pre-populate with sample peers
-        val samplePeers = listOf(
-            PeerNodeEntity("a1b2", "Pixel 7 Pro", -62, 1, 2, "Bluetooth LE"),
-            PeerNodeEntity("c3d4", "Galaxy S22", -78, 1, 5, "Bluetooth LE"),
-            PeerNodeEntity("e5f6", "Heltec V3 Bridge", -45, 1, 1, "LoRa 915MHz"),
-            PeerNodeEntity("7890", "OnePlus 11 Relay", -91, 3, 18, "Wi-Fi Direct")
-        )
-        samplePeers.forEach { peerStore[it.nodeId] = it }
-        _peersFlow.value = peerStore.values.toList().sortedByDescending { it.rssiDbm }
+        outboundQueue.add(packet)
+        recordLocalMessage(text, "PublicSos", MessageStatus.QUEUED)
+        return true
     }
 
-    fun syncResourcePins() {
-        val jsonStr = MeshCoreBridge.getActivePinsJsonSafe() ?: return
-        try {
-            val jsonArray = JSONArray(jsonStr)
-            for (i in 0 until jsonArray.length()) {
-                val obj = jsonArray.getJSONObject(i)
-                val pinId = obj.getString("pin_id")
-                val pinType = obj.getString("pin_type")
-                val latitude = obj.getDouble("latitude").toFloat()
-                val longitude = obj.getDouble("longitude").toFloat()
-                val label = obj.getString("label")
-                val createdAt = obj.getLong("created_at")
-                val expiresAt = obj.getLong("expires_at")
-                val creatorPubkey = obj.getString("creator_pubkey")
-                val signatureHex = obj.getString("signature_hex")
-                val verifiedCount = obj.getInt("verified_count")
-
-                val entity = ResourcePinEntity(
-                    pinId = pinId,
-                    pinType = pinType,
-                    latitude = latitude,
-                    longitude = longitude,
-                    label = label,
-                    createdAt = createdAt,
-                    expiresAt = expiresAt,
-                    creatorPubkey = creatorPubkey,
-                    signatureHex = signatureHex,
-                    verifiedCount = verifiedCount
-                )
-                pinStore[pinId] = entity
-            }
-            _pinsFlow.value = pinStore.values.toList().sortedBy { it.createdAt }
-        } catch (e: Exception) {
-            e.printStackTrace()
+    /**
+     * Builds, records, and queues an encrypted chat message.
+     * Returns false when no secure session exists with the recipient; the
+     * message is never downgraded to plaintext.
+     */
+    fun sendChat(recipientIdHex: String, text: String): Boolean {
+        val packet = MeshCoreBridge.createChat(recipientIdHex, text)
+        if (packet == null) {
+            Log.w(TAG, "Chat not sent: no secure session with $recipientIdHex.")
+            recordLocalMessage(text, "Chat", MessageStatus.FAILED, recipientIdHex, encrypted = true)
+            return false
         }
+        outboundQueue.add(packet)
+        recordLocalMessage(text, "Chat", MessageStatus.QUEUED, recipientIdHex, encrypted = true)
+        return true
     }
 
-    fun createAndBroadcastSignedPin(
+    /** Starts a Noise handshake so chat with this peer becomes possible. */
+    fun startHandshake(peerIdHex: String): Boolean {
+        val packet = MeshCoreBridge.beginHandshake(peerIdHex) ?: return false
+        outboundQueue.add(packet)
+        return true
+    }
+
+    /** Creates and queues a signed resource pin. Returns false on failure. */
+    fun createAndBroadcastPin(
         label: String,
         latitude: Float,
         longitude: Float,
         type: String,
         expiresInSecs: Long
-    ): ByteArray? {
+    ): Boolean {
         val pinId = UUID.randomUUID()
         val pinIdBytes = ByteArray(16)
-        val buffer = java.nio.ByteBuffer.wrap(pinIdBytes)
-        buffer.putLong(pinId.mostSignificantBits)
-        buffer.putLong(pinId.leastSignificantBits)
-
-        val pinTypeVal = when (type) {
-            "WaterPoint" -> 1
-            "Shelter" -> 2
-            "MedicalStation" -> 3
-            "Hazard" -> 4
-            "Roadblock" -> 5
-            else -> 1
+        ByteBuffer.wrap(pinIdBytes).apply {
+            putLong(pinId.mostSignificantBits)
+            putLong(pinId.leastSignificantBits)
         }
 
-        val packetBytes = MeshCoreBridge.createSignedPinPacketSafe(
+        val packet = MeshCoreBridge.createPin(
             pinIdBytes,
-            pinTypeVal,
+            pinTypeValue(type),
             latitude,
             longitude,
             label,
             expiresInSecs
         )
+        if (packet == null) {
+            Log.e(TAG, "Pin could not be created; mesh core unavailable.")
+            return false
+        }
 
+        outboundQueue.add(packet)
         syncResourcePins()
-
-        val newSosMsg = MessageEntity(
-            msgId = pinId.toString(),
-            senderId = "Me",
-            recipientId = "All",
-            payloadText = "Resource Pin: $label ($type)",
-            ttl = 8,
-            timestamp = System.currentTimeMillis(),
-            packetType = "ResourcePin",
-            status = "QUEUED"
-        )
-        queueMessage(newSosMsg)
-
-        return packetBytes
+        return true
     }
 
-    fun queueRawPacket(packetBytes: ByteArray) {
-        rawPacketsQueue.add(packetBytes)
-    }
-
-    fun getPendingPacketsForTx(): List<ByteArray> {
+    /** Drains everything waiting to be transmitted. */
+    fun drainOutbound(): List<ByteArray> {
         val packets = mutableListOf<ByteArray>()
-        
-        // 1. Drain raw packets queue (forwarded/relayed packets)
         while (true) {
-            val p = rawPacketsQueue.poll() ?: break
-            packets.add(p)
+            packets.add(outboundQueue.poll() ?: break)
         }
-        
-        // 2. Generate packets for locally queued messages
-        val queuedMessages = messageStore.values.filter { it.status == "QUEUED" }
-        for (msg in queuedMessages) {
-            val bytes = getPacketBytes(msg)
-            if (bytes != null) {
-                packets.add(bytes)
-                // Update status to RELAYED so we don't send it again
-                messageStore[msg.msgId] = msg.copy(status = "RELAYED")
-            }
+        if (packets.isNotEmpty()) {
+            markQueuedAsSent()
         }
-        
-        _messagesFlow.value = messageStore.values.toList().sortedBy { it.timestamp }
         return packets
     }
 
-    private fun getPacketBytes(msg: MessageEntity): ByteArray? {
-        return if (MeshCoreBridge.isNativeReady()) {
-            when (msg.packetType) {
-                "PublicSos" -> MeshCoreBridge.createPublicSosSafe(msg.payloadText, 37.7749f, -122.4194f)
-                "Chat" -> MeshCoreBridge.createChatPacketSafe(msg.payloadText, msg.recipientId)
-                "ResourcePin" -> {
-                    val pin = pinStore[msg.msgId]
-                    if (pin != null) {
-                        val pinIdBytes = UUID.fromString(pin.pinId).let { uuid ->
-                            val bytes = ByteArray(16)
-                            val buf = java.nio.ByteBuffer.wrap(bytes)
-                            buf.putLong(uuid.mostSignificantBits)
-                            buf.putLong(uuid.leastSignificantBits)
-                            bytes
-                        }
-                        val typeVal = when (pin.pinType) {
-                            "WaterPoint" -> 1
-                            "Shelter" -> 2
-                            "MedicalStation" -> 3
-                            "Hazard" -> 4
-                            "Roadblock" -> 5
-                            else -> 1
-                        }
-                        MeshCoreBridge.createSignedPinPacketSafe(
-                            pinIdBytes,
-                            typeVal,
-                            pin.latitude,
-                            pin.longitude,
-                            pin.label,
-                            (pin.expiresAt - pin.createdAt) / 1000
-                        )
-                    } else null
-                }
-                else -> null
-            }
-        } else {
-            // Fallback modes
-            when (msg.packetType) {
-                "PublicSos" -> MeshCoreBridge.createPublicSosFallback(msg.payloadText, 37.7749f, -122.4194f)
-                "Chat" -> "CHAT_V1|${msg.msgId}|${msg.senderId}|${msg.recipientId}|${msg.payloadText}|${msg.ttl}|${msg.timestamp}".toByteArray(Charsets.UTF_8)
-                "ResourcePin" -> {
-                    val pin = pinStore[msg.msgId]
-                    if (pin != null) {
-                        val pinIdBytes = UUID.fromString(pin.pinId).let { uuid ->
-                            val bytes = ByteArray(16)
-                            val buf = java.nio.ByteBuffer.wrap(bytes)
-                            buf.putLong(uuid.mostSignificantBits)
-                            buf.putLong(uuid.leastSignificantBits)
-                            bytes
-                        }
-                        val typeVal = when (pin.pinType) {
-                            "WaterPoint" -> 1
-                            "Shelter" -> 2
-                            "MedicalStation" -> 3
-                            "Hazard" -> 4
-                            "Roadblock" -> 5
-                            else -> 1
-                        }
-                        MeshCoreBridge.createSignedPinPacketFallback(
-                            pinIdBytes,
-                            typeVal,
-                            pin.latitude,
-                            pin.longitude,
-                            pin.label,
-                            (pin.expiresAt - pin.createdAt) / 1000
-                        )
-                    } else null
-                }
-                else -> null
-            }
-        }
+    fun queueRawPacket(packet: ByteArray) {
+        outboundQueue.add(packet)
     }
 
-    fun processIncomingPacket(rawPacket: ByteArray): ByteArray? {
-        val result = if (MeshCoreBridge.isNativeReady()) {
-            val forwardBytes = MeshCoreBridge.processIncomingPacketSafe(rawPacket)
-            if (forwardBytes != null) {
-                queueRawPacket(forwardBytes)
-            }
-            
-            // Parse the packet to display in UI if it is a Chat or SOS packet
-            val jsonStr = MeshCoreBridge.parsePacketJsonSafe(rawPacket)
-            if (jsonStr != null) {
-                try {
-                    val obj = JSONObject(jsonStr)
-                    val msgId = obj.getString("msg_id")
-                    val senderId = obj.getString("sender_id").take(6)
-                    val recipientId = obj.getString("recipient_id")
-                    val packetType = obj.getString("packet_type")
-                    val ttl = obj.getInt("ttl")
-                    val timestamp = obj.getLong("timestamp") * 1000
-                    val payloadText = obj.getString("payload_text")
-                    
-                    if (packetType == "Chat" || packetType == "PublicSos" || packetType == "PrivateSos") {
-                        if (!messageStore.containsKey(msgId)) {
-                            val entity = MessageEntity(
-                                msgId = msgId,
-                                senderId = "Node #$senderId",
-                                recipientId = recipientId,
-                                payloadText = payloadText,
-                                ttl = ttl,
-                                timestamp = timestamp,
-                                packetType = packetType,
-                                status = "RELAYED"
-                            )
-                            queueMessage(entity)
-                        }
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-            
-            syncResourcePins()
-            forwardBytes
-        } else {
-            // Kotlin Fallback mode
-            val str = String(rawPacket, Charsets.UTF_8)
-            if (str.startsWith("SOS_V1|") || str.startsWith("CHAT_V1|")) {
-                val parts = str.split("|")
-                val type = if (parts[0] == "SOS_V1") "PublicSos" else "Chat"
-                val id = parts.getOrNull(1) ?: UUID.randomUUID().toString()
-                if (!messageStore.containsKey(id)) {
-                    val sender = parts.getOrNull(2) ?: "Peer"
-                    val recipient = if (type == "PublicSos") "All" else (parts.getOrNull(3) ?: "All")
-                    val msg = if (type == "PublicSos") parts.getOrNull(2) ?: "" else (parts.getOrNull(4) ?: "")
-                    val ts = parts.lastOrNull()?.toLongOrNull() ?: System.currentTimeMillis()
-                    
-                    val entity = MessageEntity(
-                        msgId = id,
-                        senderId = if (sender == "Me") "Me" else "Node #$sender",
-                        recipientId = recipient,
-                        payloadText = msg,
-                        ttl = 7,
-                        timestamp = ts,
-                        packetType = type,
-                        status = "RELAYED"
+    fun hasPendingOutbound(): Boolean = outboundQueue.isNotEmpty()
+
+    // -----------------------------------------------------------------------
+    // Inbound
+    // -----------------------------------------------------------------------
+
+    /**
+     * Hands a raw frame to the native core for verification and acts on the
+     * result. Frames that fail authentication are dropped silently; they are
+     * noise or hostile, and either way nothing about them should reach the UI.
+     */
+    fun processIncomingPacket(rawPacket: ByteArray, transport: String = "Bluetooth LE") {
+        val json = MeshCoreBridge.processIncoming(rawPacket)
+        if (json == null) {
+            // Not an error worth surfacing: unverifiable traffic is expected on
+            // an open radio and is simply not ours to act on.
+            return
+        }
+
+        try {
+            val obj = JSONObject(json)
+            val packetType = obj.getString("packet_type")
+            val senderId = obj.getString("sender_id")
+            val msgId = obj.getString("msg_id")
+            val ttl = obj.getInt("ttl")
+            val timestampMillis = obj.getLong("timestamp") * 1000L
+            val addressedToUs = obj.getBoolean("addressed_to_us")
+
+            // Anything that needs to go back out.
+            obj.optStringOrNull("relay_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
+            obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
+            obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
+
+            observePeer(senderId, transport)
+
+            when (packetType) {
+                "PublicSos" -> obj.optStringOrNull("sos_text")?.let { text ->
+                    upsertMessage(
+                        MessageEntity(
+                            msgId = msgId,
+                            senderId = senderId,
+                            recipientId = MessageEntity.BROADCAST_RECIPIENT,
+                            payloadText = text,
+                            ttl = ttl,
+                            timestampMillis = timestampMillis,
+                            packetType = packetType,
+                            status = MessageStatus.SENT,
+                            encrypted = false
+                        )
                     )
-                    queueMessage(entity)
-                    queueRawPacket(rawPacket)
                 }
-            } else if (str.startsWith("PIN_V1|")) {
-                val parts = str.split("|")
-                val id = parts.getOrNull(1) ?: ""
-                if (!pinStore.containsKey(id)) {
-                    val type = parts.getOrNull(2) ?: "WaterPoint"
-                    val lat = parts.getOrNull(3)?.toFloatOrNull() ?: 0.0f
-                    val lon = parts.getOrNull(4)?.toFloatOrNull() ?: 0.0f
-                    val label = parts.getOrNull(5) ?: ""
-                    val tsCreated = parts.getOrNull(6)?.toLongOrNull() ?: System.currentTimeMillis()
-                    val tsExpires = parts.getOrNull(7)?.toLongOrNull() ?: (System.currentTimeMillis() + 86400000)
-                    
-                    val entity = ResourcePinEntity(id, type, lat, lon, label, tsCreated, tsExpires, "peer_pubkey", "peer_sig", 1)
-                    upsertResourcePin(entity)
-                    queueRawPacket(rawPacket)
+
+                "Chat" -> if (addressedToUs) {
+                    obj.optStringOrNull("plaintext")?.let { text ->
+                        upsertMessage(
+                            MessageEntity(
+                                msgId = msgId,
+                                senderId = senderId,
+                                recipientId = MessageEntity.LOCAL_SENDER,
+                                payloadText = text,
+                                ttl = ttl,
+                                timestampMillis = timestampMillis,
+                                packetType = packetType,
+                                status = MessageStatus.SENT,
+                                encrypted = true
+                            )
+                        )
+                    }
                 }
+
+                "Ack" -> if (addressedToUs) {
+                    markDelivered(msgId)
+                }
+
+                "ResourcePin" -> syncResourcePins()
+
+                "NoiseHandshake" -> refreshPeerSessionState(senderId)
             }
-            null
-        }
-        return result
-    }
-
-    fun queueMessage(message: MessageEntity) {
-        messageStore[message.msgId] = message
-        _messagesFlow.value = messageStore.values.toList().sortedBy { it.timestamp }
-    }
-
-    fun getPendingMessagesForRelay(): List<MessageEntity> {
-        return messageStore.values.filter { it.status == "QUEUED" && it.ttl > 0 }
-    }
-
-    fun markMessageDelivered(msgId: String) {
-        messageStore[msgId]?.let {
-            messageStore[msgId] = it.copy(status = "DELIVERED_ACK")
-            _messagesFlow.value = messageStore.values.toList().sortedBy { it.timestamp }
+        } catch (e: Exception) {
+            Log.w(TAG, "Malformed result from mesh core.", e)
         }
     }
 
-    fun upsertResourcePin(pin: ResourcePinEntity) {
-        pinStore[pin.pinId] = pin
-        _pinsFlow.value = pinStore.values.toList().sortedBy { it.createdAt }
+    // -----------------------------------------------------------------------
+    // Pins
+    // -----------------------------------------------------------------------
+
+    fun syncResourcePins() {
+        val jsonStr = MeshCoreBridge.activePinsJson() ?: return
+        try {
+            val array = JSONArray(jsonStr)
+            val seen = mutableSetOf<String>()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val entity = ResourcePinEntity(
+                    pinId = obj.getString("pin_id"),
+                    pinType = obj.getString("pin_type"),
+                    latitude = obj.getDouble("latitude").toFloat(),
+                    longitude = obj.getDouble("longitude").toFloat(),
+                    label = obj.getString("label"),
+                    createdAtSecs = obj.getLong("created_at"),
+                    expiresAtSecs = obj.getLong("expires_at"),
+                    creatorId = obj.getString("creator_id")
+                )
+                pinStore[entity.pinId] = entity
+                seen += entity.pinId
+            }
+            // The core is authoritative: pins it dropped have expired.
+            pinStore.keys.retainAll(seen)
+            publishPins()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not parse pins from mesh core.", e)
+        }
     }
 
     fun getActiveResourcePins(): List<ResourcePinEntity> {
         syncResourcePins()
-        val now = System.currentTimeMillis()
-        return pinStore.values.filter { it.expiresAt > now }
+        return _pinsFlow.value
     }
 
-    fun pruneExpiredPackets() {
-        val now = System.currentTimeMillis()
-        val removed = pinStore.values.removeIf { it.expiresAt <= now }
-        if (removed) {
-            _pinsFlow.value = pinStore.values.toList().sortedBy { it.createdAt }
+    private fun publishPins() {
+        val nowSecs = System.currentTimeMillis() / 1000
+        _pinsFlow.value = pinStore.values
+            .filterNot { it.isExpired(nowSecs) }
+            .sortedByDescending { it.createdAtSecs }
+    }
+
+    // -----------------------------------------------------------------------
+    // Peers
+    // -----------------------------------------------------------------------
+
+    /** Records that we heard an authenticated packet from this node. */
+    fun observePeer(nodeId: String, transport: String, rssiDbm: Int? = null) {
+        val existing = peerStore[nodeId]
+        peerStore[nodeId] = PeerNodeEntity(
+            nodeId = nodeId,
+            displayName = "Node ${nodeId.take(6)}",
+            rssiDbm = rssiDbm ?: existing?.rssiDbm ?: 0,
+            lastSeenMillis = System.currentTimeMillis(),
+            transport = transport,
+            hasSecureSession = MeshCoreBridge.hasSession(nodeId)
+        )
+        publishPeers()
+    }
+
+    private fun refreshPeerSessionState(nodeId: String) {
+        peerStore[nodeId]?.let {
+            peerStore[nodeId] = it.copy(hasSecureSession = MeshCoreBridge.hasSession(nodeId))
+            publishPeers()
         }
     }
 
-    fun upsertPeer(peer: PeerNodeEntity) {
-        peerStore[peer.nodeId] = peer
-        _peersFlow.value = peerStore.values.toList().sortedByDescending { it.rssiDbm }
+    fun prunePeers() {
+        val cutoff = System.currentTimeMillis() - PEER_STALE_MILLIS
+        val before = peerStore.size
+        peerStore.values.removeIf { it.lastSeenMillis < cutoff }
+        if (peerStore.size != before) publishPeers()
     }
 
-    fun getActivePeers(): List<PeerNodeEntity> {
-        return peerStore.values.toList()
+    private fun publishPeers() {
+        _peersFlow.value = peerStore.values.sortedByDescending { it.lastSeenMillis }
     }
+
+    // -----------------------------------------------------------------------
+    // Messages
+    // -----------------------------------------------------------------------
+
+    private fun recordLocalMessage(
+        text: String,
+        packetType: String,
+        status: MessageStatus,
+        recipientId: String = MessageEntity.BROADCAST_RECIPIENT,
+        encrypted: Boolean = false
+    ) {
+        upsertMessage(
+            MessageEntity(
+                msgId = UUID.randomUUID().toString(),
+                senderId = MessageEntity.LOCAL_SENDER,
+                recipientId = recipientId,
+                payloadText = text,
+                ttl = 8,
+                timestampMillis = System.currentTimeMillis(),
+                packetType = packetType,
+                status = status,
+                encrypted = encrypted
+            )
+        )
+    }
+
+    private fun upsertMessage(message: MessageEntity) {
+        messageStore[message.msgId] = message
+        publishMessages()
+    }
+
+    private fun markQueuedAsSent() {
+        var changed = false
+        messageStore.forEach { (id, msg) ->
+            if (msg.status == MessageStatus.QUEUED) {
+                messageStore[id] = msg.copy(status = MessageStatus.SENT)
+                changed = true
+            }
+        }
+        if (changed) publishMessages()
+    }
+
+    private fun markDelivered(ackedMsgId: String) {
+        messageStore[ackedMsgId]?.let {
+            messageStore[ackedMsgId] = it.copy(status = MessageStatus.DELIVERED)
+            publishMessages()
+        }
+    }
+
+    private fun publishMessages() {
+        _messagesFlow.value = messageStore.values.sortedBy { it.timestampMillis }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    private fun pinTypeValue(type: String): Int = when (type) {
+        "WaterPoint" -> 1
+        "Shelter" -> 2
+        "MedicalStation" -> 3
+        "Hazard" -> 4
+        "Roadblock" -> 5
+        else -> 1
+    }
+
+    private fun JSONObject.optStringOrNull(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optString(key).takeIf { it.isNotEmpty() }
+    }
+
+    private fun String.hexToBytes(): ByteArray =
+        ByteArray(length / 2) { i ->
+            substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
 }
