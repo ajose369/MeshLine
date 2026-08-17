@@ -1,69 +1,95 @@
 # Deploying `site/`
 
-Target: `https://meshline.praharilabs.com`, served by Caddy on the OCI box
-(`144.24.141.188`) alongside the other Prahari Labs subdomains.
+Live at **https://meshline.praharilabs.com** — deployed 17 August 2026.
 
-## Status
+There is no build step. `index.html` and `privacy.html` are self-contained:
+styles and scripts inline, no external requests.
 
-| Step | State |
-|---|---|
-| DNS `meshline` A → `144.24.141.188` | **Done** — created via the GoDaddy API, TTL 600, resolving |
-| Files copied to the server | **Not done** — port 22 unreachable from the machine this was prepared on |
-| Caddy site block | **Not done** — same reason |
+## How this host actually works
 
-Until the last two are done, `meshline.praharilabs.com` resolves but fails TLS,
-because Caddy has no site block for the host and so has never requested a
-certificate for it.
+Worth knowing before touching anything, because it is not the usual
+`/etc/caddy/Caddyfile` layout:
 
-## Steps
+- The edge proxy is a **container**, `n8n-caddy` (`caddy:2.8-alpine`), the only
+  thing bound to ports 80/443. There is no system Caddy — `systemctl status
+  caddy` reports nothing and `caddy` is not on the host PATH.
+- Its config is **`/srv/n8n/Caddyfile`**, mounted read-only into the container.
+- Static sites live in **`/srv/<name>-site`** on the host and must be
+  bind-mounted into the container individually in `/srv/n8n/docker-compose.yml`.
+  A site block pointing at a path that is not mounted will 404.
+- `praharilabs.com` is served from `/srv/praharilabs-site`, MeshLine from
+  `/srv/meshline-site`.
 
-There is no build step. `index.html` and `privacy.html` are self-contained.
+## What is in place
 
-```sh
-# 1. copy the two pages up
-scp -i /path/to/ssh-key-2026-06-02.key site/*.html \
-    ubuntu@144.24.141.188:/tmp/meshline/
+`/srv/n8n/docker-compose.yml`, under `n8n-caddy.volumes`:
 
-# 2. put them where the other sites live, then serve the host
-ssh -i /path/to/ssh-key-2026-06-02.key ubuntu@144.24.141.188
-sudo mkdir -p /var/www/meshline
-sudo cp /tmp/meshline/*.html /var/www/meshline/
-sudo caddy reload --config /etc/caddy/Caddyfile
+```yaml
+- /srv/meshline-site:/srv/meshline-site:ro
 ```
 
-Caddy block to add — match the style of the existing entries rather than
-pasting this verbatim, since the webroot convention on that box was not
-verified when this file was written:
+`/srv/n8n/Caddyfile`:
 
 ```
 meshline.praharilabs.com {
-    root * /var/www/meshline
+    encode gzip
+    root * /srv/meshline-site
     file_server
-    encode gzip zstd
 }
 ```
 
-Caddy will obtain the certificate on the first request once the block is live
-and DNS resolves, which it already does.
+DNS: `meshline` A → `144.24.141.188`, TTL 600, created via the GoDaddy API.
+Caddy obtained the certificate automatically on first request.
+
+## Updating the pages
+
+Content-only changes need no container restart — the mount is live:
+
+```sh
+KEY=/path/to/ssh-key-2026-06-02.key
+scp -i $KEY site/*.html ubuntu@144.24.141.188:/tmp/
+ssh -i $KEY ubuntu@144.24.141.188 \
+  'sudo cp /tmp/index.html /tmp/privacy.html /srv/meshline-site/ && \
+   sudo chmod 644 /srv/meshline-site/*.html'
+```
+
+Only if you change the **Caddyfile** does Caddy need to reload, and only if you
+change the **mounts** does the container need recreating:
+
+```sh
+# validate first — a syntax error here takes every site on the box down
+sudo docker run --rm -v /srv/n8n/Caddyfile:/etc/caddy/Caddyfile:ro \
+  caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+cd /srv/n8n && sudo docker compose up -d n8n-caddy   # name the service:
+                                                     # a bare `up -d` would also
+                                                     # recreate n8n
+```
+
+Back up `/srv/n8n/Caddyfile` and `docker-compose.yml` first; the convention on
+this box is `.bak-YYYYMMDD-HHMMSS`.
 
 ## Verify
 
 ```sh
-curl -sSI https://meshline.praharilabs.com | head -3
-curl -sSI https://meshline.praharilabs.com/privacy.html | head -3
+for h in meshline.praharilabs.com praharilabs.com jyotir.praharilabs.com \
+         pauseos.praharilabs.com legacy.praharilabs.com \
+         sentinel.praharilabs.com vela.praharilabs.com; do
+  printf "%-32s " "$h"
+  curl -sS -o /dev/null -w "%{http_code} tls=%{ssl_verify_result}\n" "https://$h"
+done
 ```
 
-Both should return `200` and `Server: Caddy`.
+All should be `200 tls=0`. Check the neighbours too, not just the one you
+changed — they share the single Caddy instance.
 
 ## The landing page is a separate deploy
 
-`praharilabs.com` is served from the same box out of its own webroot, so
-pushing `prahari-labs-site` to GitHub does **not** update it. The MeshLine
-section will not appear on the live landing page until that repo's
-`index.html` is copied up the same way.
+`praharilabs.com` is served from `/srv/praharilabs-site` on this same box, so
+pushing the `prahari-labs-site` repo to GitHub does **not** update the live
+site. Copy `index.html` up the same way.
 
 ## Privacy policy URL
 
-Play requires a reachable privacy policy. Once deployed, the listing URL is
-`https://meshline.praharilabs.com/privacy.html`. That page is `PRIVACY.md`
-rendered — keep the two in step.
+The Play listing URL is `https://meshline.praharilabs.com/privacy.html`. That
+page is `PRIVACY.md` rendered — keep the two in step.
