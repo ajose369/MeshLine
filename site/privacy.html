@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — MeshLine</title>
+<meta name="description" content="MeshLine has no servers, no accounts, and no analytics. This policy describes exactly what the app does with your information.">
+<meta name="theme-color" content="#070a11">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%233fe0ff'/%3E%3Cpath d='M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7' stroke='%23ff4438' stroke-width='1.8' fill='none' stroke-linecap='round'/%3E%3Cpath d='M6 18a8.5 8.5 0 0 1 0-12M18 6a8.5 8.5 0 0 1 0 12' stroke='%233fe0ff' stroke-width='1.6' fill='none' stroke-linecap='round' opacity='.6'/%3E%3C/svg%3E">
+
+<style>
+:root{
+  --void:#04060b; --night:#070a11; --card:#121826; --line:#232c3d; --line-2:#36415a;
+  --red:#ff4438; --cyan:#3fe0ff; --amber:#ffb443; --green:#3ddc97;
+  --ink:#edf2f9; --ink-2:#a8b3c7; --ink-3:#6e7a92;
+  --sans:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --mono:"Cascadia Code","SF Mono",Consolas,"Roboto Mono","Courier New",monospace;
+}
+*{ box-sizing:border-box; margin:0; padding:0; }
+body{
+  background:
+    radial-gradient(90% 55% at 78% -8%, rgba(63,224,255,.09), transparent 60%),
+    var(--night);
+  background-attachment:fixed;
+  color:var(--ink); font-family:var(--sans); font-size:16px; line-height:1.72;
+  -webkit-font-smoothing:antialiased;
+}
+a{ color:var(--cyan); text-decoration:none; }
+a:hover{ text-decoration:underline; }
+:focus-visible{ outline:2px solid var(--cyan); outline-offset:3px; }
+.wrap{ width:min(760px, calc(100% - 44px)); margin-inline:auto; }
+
+header{ border-bottom:1px solid var(--line); padding-block:1.15rem; background:rgba(6,9,15,.7); backdrop-filter:blur(12px); position:sticky; top:0; z-index:5; }
+.brand{ display:flex; align-items:center; gap:.75rem; color:var(--ink); }
+.brand svg{ width:22px; height:22px; }
+.brand b{ font-family:var(--mono); font-size:.76rem; letter-spacing:.3em; font-weight:500; }
+.brand span{ margin-left:auto; font-family:var(--mono); font-size:.64rem; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-3); }
+
+main{ padding-block:8vh 12vh; }
+.eyebrow{ font-family:var(--mono); font-size:.65rem; letter-spacing:.24em; text-transform:uppercase; color:var(--cyan); }
+h1{ font-size:clamp(2.1rem,5vw,3.2rem); letter-spacing:-.03em; line-height:1.05; margin-top:1.1rem; font-weight:700; }
+.updated{ font-family:var(--mono); font-size:.68rem; letter-spacing:.12em; color:var(--ink-3); margin-top:1rem; text-transform:uppercase; }
+.intro{ color:var(--ink-2); margin-top:1.6rem; font-size:1.04rem; }
+
+.short{
+  margin-top:2.6rem; border:1px solid rgba(61,220,151,.35); border-radius:14px;
+  background:linear-gradient(160deg, rgba(61,220,151,.09), rgba(61,220,151,.02));
+  padding:1.5rem 1.6rem;
+}
+.short b{ display:block; font-family:var(--mono); font-size:.64rem; letter-spacing:.2em; text-transform:uppercase; color:var(--green); margin-bottom:.7rem; }
+
+h2{ font-size:1.35rem; font-weight:650; letter-spacing:-.015em; margin-top:3.4rem; padding-top:1.6rem; border-top:1px solid var(--line); }
+h2:first-of-type{ margin-top:3.8rem; }
+p{ margin-top:1rem; color:var(--ink-2); }
+p strong, li strong{ color:var(--ink); font-weight:600; }
+ul{ margin-top:1rem; padding-left:1.1rem; color:var(--ink-2); }
+li{ margin-top:.75rem; }
+li::marker{ color:var(--cyan); }
+code{ font-family:var(--mono); font-size:.86em; background:var(--card); border:1px solid var(--line); border-radius:5px; padding:.1em .4em; color:var(--ink); }
+
+.tw{ overflow-x:auto; margin-top:1.3rem; border:1px solid var(--line); border-radius:12px; }
+table{ border-collapse:collapse; width:100%; min-width:520px; font-size:.9rem; }
+th,td{ text-align:left; padding:.85rem 1rem; border-bottom:1px solid var(--line); vertical-align:top; }
+tr:last-child td{ border-bottom:0; }
+th{ font-family:var(--mono); font-size:.62rem; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-3); font-weight:400; background:rgba(12,17,26,.7); }
+td{ color:var(--ink-2); }
+td:first-child{ color:var(--ink); }
+
+.warn{
+  margin-top:1.4rem; border:1px solid rgba(255,180,67,.4); border-radius:12px;
+  background:rgba(255,180,67,.07); padding:1.1rem 1.2rem; color:var(--ink-2); font-size:.95rem;
+}
+.warn b{ color:var(--amber); }
+
+footer{ border-top:1px solid var(--line); background:var(--void); padding-block:2.6rem; }
+.fb{ display:flex; flex-wrap:wrap; gap:1rem; justify-content:space-between; font-family:var(--mono); font-size:.63rem; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap brand">
+    <a href="index.html" style="display:flex;align-items:center;gap:.75rem;color:inherit">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="2.4" fill="#3fe0ff"/>
+        <path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7" stroke="#ff4438" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+        <path d="M6 18a8.5 8.5 0 0 1 0-12M18 6a8.5 8.5 0 0 1 0 12" stroke="#3fe0ff" stroke-width="1.5" fill="none" stroke-linecap="round" opacity=".6"/>
+      </svg>
+      <b>MESHLINE</b>
+    </a>
+    <span>Privacy</span>
+  </div>
+</header>
+
+<main class="wrap">
+  <p class="eyebrow">Privacy policy</p>
+  <h1>What MeshLine does with your information.</h1>
+  <p class="updated">Last updated: 15 August 2026</p>
+  <p class="intro">MeshLine is an offline, phone-to-phone emergency messaging app. This policy describes exactly what the app does with your information.</p>
+
+  <div class="short">
+    <b>The short version</b>
+    MeshLine has no servers, no accounts, and no analytics. Nothing you do in the app is sent to us, because there is nowhere for it to be sent. Your messages travel directly between phones over Bluetooth.
+  </div>
+
+  <h2>What MeshLine collects</h2>
+  <p><strong>We collect nothing.</strong> The developer operates no backend service and receives no data from the app whatsoever. There is no telemetry, no crash reporting SDK, no advertising identifier, and no third-party analytics library in the build.</p>
+
+  <h2>What stays on your device</h2>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Data</th><th>Purpose</th><th>Leaves your device?</th></tr></thead>
+      <tbody>
+        <tr><td>Mesh identity key</td><td>Signs your messages so others can verify they are genuinely from you</td><td>Only the public half, inside messages you send</td></tr>
+        <tr><td>Messages you send and receive</td><td>Displayed in the app</td><td>Only as you direct (see below)</td></tr>
+        <tr><td>Session and group keys</td><td>Encrypt your private chats and groups</td><td>No — only ciphertext produced with them</td></tr>
+        <tr><td>Which contacts you have verified</td><td>Shows whether an identity has been checked in person</td><td>No</td></tr>
+        <tr><td>Resource pins</td><td>Shown on your Pins screen</td><td>Only pins you choose to create</td></tr>
+        <tr><td>Approximate positions of received pins</td><td>Shown relative to you</td><td>No</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>All of this is encrypted on your device with keys held in the Android Keystore, and excluded from cloud backup and device transfer. Your message history is stored encrypted and capped at the most recent 2000 messages.</p>
+  <p>You can destroy all of it at any time with <strong>Wipe all secure data</strong> on the Radar screen. That deletes every session key, group key, and stored message. It cannot recall anything already sent, and it does not hide that MeshLine is installed. Your mesh identity is deliberately kept, so that contacts who verified you still recognise your device.</p>
+
+  <h2>What is transmitted, and when</h2>
+  <p>MeshLine transmits only when you take an action, or when your device relays traffic for the mesh:</p>
+  <ul>
+    <li><strong>When you send an SOS</strong>: your message text and, if a position fix is available, your coordinates are broadcast to every nearby device running MeshLine. <strong>A public SOS is not encrypted.</strong> This is deliberate — it is what allows a stranger in range to read your distress call and help you. Anyone within Bluetooth range, running any compatible software, can read it.</li>
+    <li><strong>When you send a chat message</strong>: the text is end-to-end encrypted (Noise-XX) and can only be read by the recipient you selected. Devices that relay it cannot read it.</li>
+    <li><strong>When you send a group message</strong>: the text is end-to-end encrypted to that group's members only. Devices that relay it cannot read it, and cannot tell which group it belongs to — the packet is addressed to a value derived from the group key rather than to the group's name. What a nearby observer <em>can</em> see is that some group is active and which devices are transmitting for it. Message contents, the group's name, and its member list stay private.</li>
+    <li><strong>When you create a resource pin</strong>: the label, the pin type, and the coordinates of the pin are broadcast unencrypted so others can find the resource.</li>
+    <li><strong>When your device relays</strong>: MeshLine passes other people's packets onward to extend the network's reach. Relayed content is not stored beyond what is needed to forward it and to avoid forwarding the same packet twice.</li>
+  </ul>
+
+  <h2>Location</h2>
+  <p>MeshLine requests precise location for two purposes only:</p>
+  <ul>
+    <li>To attach coordinates to an SOS or resource pin <strong>that you choose to send</strong>.</li>
+    <li>On Android 11 and earlier, because the operating system requires the location permission for Bluetooth scanning. MeshLine does not use scan results to determine your location, which is why the app declares <code>neverForLocation</code> on its Bluetooth scan permission.</li>
+  </ul>
+  <div class="warn"><b>Your location is never collected, logged, or transmitted in the background.</b> If you never send an SOS or place a pin, your location never leaves your device.</div>
+
+  <h2>Permissions</h2>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Permission</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Nearby devices (Bluetooth scan, advertise, connect)</td><td>Discover nearby phones and exchange mesh packets</td></tr>
+        <tr><td>Precise location</td><td>Attach coordinates to an SOS or pin you send; required for Bluetooth scanning below Android 12</td></tr>
+        <tr><td>Notifications</td><td>Show that the mesh relay is running</td></tr>
+        <tr><td>Foreground service (connected device)</td><td>Keep relaying while the app is in the background</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Children</h2>
+  <p>MeshLine is not directed at children and collects no data from anyone.</p>
+
+  <h2>Data deletion</h2>
+  <p>All MeshLine data lives on your device. Uninstalling the app, or clearing its storage from Android Settings, permanently deletes your mesh identity, your messages, and your pins. There is no server-side copy to request deletion of.</p>
+
+  <h2>Changes</h2>
+  <p>Material changes to this policy will be published at this URL with an updated date, and noted in the app's release notes.</p>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy: <a href="mailto:aldrinjose007@gmail.com">aldrinjose007@gmail.com</a></p>
+</main>
+
+<footer>
+  <div class="wrap fb">
+    <span>© 2026 Prahari Labs · Made in India</span>
+    <span><a href="index.html">Back to MeshLine</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

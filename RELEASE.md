@@ -201,7 +201,9 @@ codebase.
       "Emergency messaging between nearby phones. No internet, no SIM, no server."
 - [ ] **Full description** (≤4000 chars). Must not claim LoRa or Wi-Fi Direct
       support — see the scope note below.
-- [ ] **Privacy policy URL** — publish `PRIVACY.md` publicly and paste the URL.
+- [ ] **Privacy policy URL** — deploy `site/` and paste
+      `https://meshline.praharilabs.com/privacy.html`. That page is
+      `PRIVACY.md` rendered; keep the two in step when either changes.
 - [ ] **Content rating questionnaire.**
 - [ ] **Target audience**: select adults; this is not a children's app.
 

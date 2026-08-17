@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshLine — Messaging that survives the network</title>
+<meta name="description" content="MeshLine hops emergency messages directly between nearby phones over Bluetooth LE. No cell tower, no internet, no SIM, no server. Every packet signed, every private word end-to-end encrypted.">
+<meta name="theme-color" content="#070a11">
+<meta property="og:type" content="website">
+<meta property="og:title" content="MeshLine — Messaging that survives the network">
+<meta property="og:description" content="Phone-to-phone emergency messaging over Bluetooth LE. No tower, no internet, no server, no account.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='2.4' fill='%233fe0ff'/%3E%3Cpath d='M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7' stroke='%23ff4438' stroke-width='1.8' fill='none' stroke-linecap='round'/%3E%3Cpath d='M6 18a8.5 8.5 0 0 1 0-12M18 6a8.5 8.5 0 0 1 0 12' stroke='%233fe0ff' stroke-width='1.6' fill='none' stroke-linecap='round' opacity='.6'/%3E%3C/svg%3E">
+
+<style>
+/* ==========================================================================
+   MESHLINE — offline mesh communication
+   One nocturnal world. Colour is never decorative: red is distress, cyan is
+   the mesh, amber is "true but unverified", green is confirmed.
+   ========================================================================== */
+
+:root{
+  --void:#04060b;
+  --night:#070a11;
+  --pool:#0c111a;
+  --card:#121826;
+  --card-2:#19212f;
+  --line:#232c3d;
+  --line-2:#36415a;
+
+  --red:#ff4438;
+  --red-deep:#8c1710;
+  --cyan:#3fe0ff;
+  --cyan-deep:#0b6e8c;
+  --amber:#ffb443;
+  --green:#3ddc97;
+  --violet:#9b8cff;
+
+  --ink:#edf2f9;
+  --ink-2:#a8b3c7;
+  --ink-3:#6e7a92;
+
+  --sans:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --mono:"Cascadia Code","SF Mono",Consolas,"Roboto Mono","Courier New",monospace;
+
+  --w:1180px;
+  --nav:70px;
+}
+
+*{ box-sizing:border-box; margin:0; padding:0; }
+
+html{ scroll-behavior:smooth; }
+body{
+  background:var(--night);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:16px;
+  line-height:1.65;
+  overflow-x:clip;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{ background:rgba(63,224,255,.28); color:#fff; }
+a{ color:inherit; text-decoration:none; }
+svg,canvas,img{ display:block; max-width:100%; }
+:focus-visible{ outline:2px solid var(--cyan); outline-offset:3px; border-radius:3px; }
+
+.wrap{ width:min(var(--w),calc(100% - 44px)); margin-inline:auto; }
+
+/* ---------- type ---------- */
+h1,h2,h3{ font-weight:700; letter-spacing:-.025em; line-height:1.02; text-wrap:balance; }
+
+.eyebrow{
+  font-family:var(--mono); font-size:.66rem; letter-spacing:.24em; text-transform:uppercase;
+  color:var(--cyan); display:flex; align-items:center; gap:.85em;
+}
+.eyebrow::before{ content:""; width:26px; height:1px; background:currentColor; opacity:.75; flex:none; }
+.eyebrow.red{ color:var(--red); }
+.eyebrow.amber{ color:var(--amber); }
+.eyebrow.green{ color:var(--green); }
+.eyebrow.violet{ color:var(--violet); }
+
+.lede{ color:var(--ink-2); font-size:clamp(1rem,1.25vw,1.14rem); max-width:36em; }
+
+/* ---------- reveal ---------- */
+.js .rv{ opacity:0; transform:translateY(22px); transition:opacity .85s cubic-bezier(.2,.6,.2,1), transform .85s cubic-bezier(.2,.6,.2,1); transition-delay:var(--d,0s); }
+.js .rv.in{ opacity:1; transform:none; }
+
+/* ---------- progress rail ---------- */
+.progress{
+  position:fixed; inset:0 0 auto 0; height:2px; z-index:70;
+  background:linear-gradient(90deg,var(--cyan),var(--green));
+  transform-origin:0 50%; transform:scaleX(0); pointer-events:none;
+}
+
+/* ---------- nav ---------- */
+nav{
+  position:fixed; inset:0 0 auto 0; z-index:60; height:var(--nav);
+  display:flex; align-items:center;
+  border-bottom:1px solid transparent;
+  transition:background .45s ease, border-color .45s ease, backdrop-filter .45s ease;
+}
+nav.on{
+  background:rgba(6,9,15,.8);
+  backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+  border-bottom-color:var(--line);
+}
+.nav-in{ width:min(var(--w),calc(100% - 44px)); margin-inline:auto; display:flex; align-items:center; gap:2rem; }
+.brand{ display:flex; align-items:center; gap:.75rem; margin-right:auto; }
+.brand svg{ width:24px; height:24px; }
+.brand b{ font-family:var(--mono); font-size:.78rem; letter-spacing:.3em; font-weight:500; }
+.nav-links{ display:flex; gap:1.9rem; list-style:none; }
+.nav-links a{
+  font-family:var(--mono); font-size:.68rem; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--ink-3); padding:.35em 0; position:relative; transition:color .3s;
+}
+.nav-links a::after{
+  content:""; position:absolute; left:0; bottom:0; height:1px; width:100%;
+  background:var(--cyan); transform:scaleX(0); transform-origin:100% 50%; transition:transform .35s cubic-bezier(.2,.6,.2,1);
+}
+.nav-links a:hover{ color:var(--ink); }
+.nav-links a:hover::after{ transform:scaleX(1); transform-origin:0 50%; }
+.nav-cta{
+  font-family:var(--mono); font-size:.66rem; letter-spacing:.16em; text-transform:uppercase;
+  background:var(--cyan); color:#04070d; padding:.7em 1.25em; border-radius:6px;
+  transition:transform .28s ease, box-shadow .28s ease;
+}
+.nav-cta:hover{ transform:translateY(-1px); box-shadow:0 8px 26px rgba(63,224,255,.25); }
+
+/* ---------- buttons ---------- */
+.btn{
+  display:inline-flex; align-items:center; gap:.7em;
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.16em; text-transform:uppercase;
+  padding:1em 1.5em; border-radius:10px; border:1px solid transparent;
+  transition:transform .3s cubic-bezier(.2,.6,.2,1), box-shadow .3s ease, background .3s ease;
+}
+.btn .arr{ transition:transform .3s ease; }
+.btn:hover .arr{ transform:translateX(4px); }
+.btn-solid{ background:linear-gradient(135deg,var(--red),var(--red-deep)); color:#fff; }
+.btn-solid:hover{ transform:translateY(-2px); box-shadow:0 14px 40px rgba(255,68,56,.28); }
+.btn-ghost{ border-color:var(--line-2); color:var(--ink-2); }
+.btn-ghost:hover{ border-color:var(--cyan); color:var(--ink); transform:translateY(-2px); }
+
+/* ==========================================================================
+   HERO
+   ========================================================================== */
+.hero{
+  position:relative; min-height:100svh; display:flex; align-items:center;
+  overflow:hidden;
+  background:
+    radial-gradient(115% 85% at 76% 6%, rgba(63,224,255,.10), transparent 58%),
+    radial-gradient(80% 70% at 8% 100%, rgba(255,68,56,.09), transparent 60%),
+    var(--void);
+}
+#lattice{ position:absolute; inset:0; width:100%; height:100%; opacity:0; transition:opacity 1.6s ease .3s; }
+.loaded #lattice{ opacity:1; }
+.hero::after{
+  content:""; position:absolute; inset:auto 0 0 0; height:32vh;
+  background:linear-gradient(180deg,transparent,var(--night)); pointer-events:none;
+}
+.hero-in{ position:relative; z-index:2; padding-block:calc(var(--nav) + 4vh) 10vh; }
+
+.hl{ font-size:clamp(2.7rem,7.2vw,6.2rem); letter-spacing:-.035em; }
+.hl-line{ display:block; overflow:hidden; padding-block:.03em; }
+.hl-line i{ display:inline-block; font-style:normal; transform:translateY(110%); }
+.loaded .hl-line i{ animation:rise 1.05s cubic-bezier(.19,.74,.22,1) forwards; }
+.hl-line:nth-child(2) i{ animation-delay:.1s; }
+.hl-line:nth-child(3) i{ animation-delay:.2s; }
+.hl em{ font-style:normal; color:var(--red); }
+@keyframes rise{ to{ transform:translateY(0); } }
+
+.hero .eyebrow{ margin-bottom:1.8rem; }
+.hero .lede{ margin-top:1.7rem; opacity:0; transform:translateY(14px); transition:opacity 1s ease .85s, transform 1s ease .85s; }
+.loaded .hero .lede{ opacity:1; transform:none; }
+.cta-row{ display:flex; flex-wrap:wrap; gap:.9rem; margin-top:2.2rem; opacity:0; transition:opacity 1s ease 1.05s; }
+.loaded .cta-row{ opacity:1; }
+
+.hero-strip{
+  margin-top:3.2rem; display:grid; grid-template-columns:repeat(4,1fr); gap:1px;
+  background:var(--line); border:1px solid var(--line); border-radius:12px; overflow:hidden;
+  opacity:0; transition:opacity 1.1s ease 1.25s;
+}
+.loaded .hero-strip{ opacity:1; }
+.hs{ background:rgba(9,13,21,.82); padding:1.1rem 1.2rem; backdrop-filter:blur(8px); }
+.hs b{ display:block; font-family:var(--mono); font-size:1.35rem; letter-spacing:-.02em; color:var(--ink); font-weight:500; }
+.hs span{ font-size:.72rem; color:var(--ink-3); letter-spacing:.02em; }
+
+.cue{
+  position:absolute; left:50%; bottom:3.2vh; translate:-50% 0; z-index:2;
+  display:flex; flex-direction:column; align-items:center; gap:.7rem;
+  font-family:var(--mono); font-size:.6rem; letter-spacing:.26em; text-transform:uppercase; color:var(--ink-3);
+  opacity:0; transition:opacity 1s ease 1.6s;
+}
+.loaded .cue{ opacity:1; }
+.cue span.stem{ width:1px; height:38px; background:linear-gradient(180deg,var(--cyan),transparent); }
+
+/* ---------- ticker ---------- */
+.ticker{ border-block:1px solid var(--line); background:var(--void); overflow:hidden; padding-block:.9rem; }
+.tick-track{ display:flex; width:max-content; animation:tick 34s linear infinite; }
+.tick-track span{
+  font-family:var(--mono); font-size:.7rem; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--ink-3); white-space:nowrap; padding-right:0;
+}
+.tick-track b{ color:var(--ink-2); font-weight:500; }
+.tick-track i{ color:var(--cyan); font-style:normal; padding-inline:1.4em; }
+@keyframes tick{ to{ transform:translateX(-25%); } }
+
+/* ==========================================================================
+   SECTIONS
+   ========================================================================== */
+section{ position:relative; }
+.sec-head{ padding-block:9vh 0; }
+.sec-head h2{ font-size:clamp(2.2rem,5vw,4.1rem); margin-top:1.6rem; max-width:16em; }
+.sec-head h2 em{ font-style:normal; color:var(--cyan); }
+.sec-head p{ margin-top:1.6rem; }
+
+/* ---------- thesis (scroll-lit) ---------- */
+.thesis{ height:230vh; }
+.thesis-sticky{ position:sticky; top:0; min-height:100svh; display:flex; align-items:center; }
+.thesis p{
+  font-size:clamp(1.5rem,3.7vw,3.1rem); line-height:1.24; letter-spacing:-.025em; font-weight:600;
+  max-width:19em;
+}
+.thesis .w{ color:#232c3d; transition:color .28s ease; }
+.thesis .w.on{ color:var(--ink); }
+.thesis .w.red.on{ color:var(--red); }
+.thesis .w.cyan.on{ color:var(--cyan); }
+
+/* ---------- 3D relay corridor ---------- */
+.relay{ height:340vh; }
+.relay-sticky{ position:sticky; top:0; height:100svh; display:flex; flex-direction:column; justify-content:center; overflow:hidden; }
+.stage{ perspective:1200px; perspective-origin:50% 46%; }
+.rail{
+  position:relative; height:min(46vh,340px); transform-style:preserve-3d;
+  /* The translateX compensates for perspective: the far end of the chain
+     shrinks toward the centre, which would otherwise leave the whole cluster
+     sitting to the right of the column. */
+  transform:translateX(var(--rail-x,-52px)) scale(var(--rail-s,1)) rotateX(calc(9deg - var(--p,0) * 6deg)) rotateY(calc(-24deg + var(--p,0) * 20deg)) translateZ(-60px);
+  transition:transform .1s linear;
+  margin-top:1.5rem;
+}
+.hop{
+  position:absolute; top:50%; left:50%;
+  width:112px; height:186px; margin:-93px 0 0 -56px;
+  border-radius:16px; border:1px solid var(--line-2);
+  background:linear-gradient(160deg,rgba(24,32,46,.96),rgba(10,14,22,.96));
+  transform-style:preserve-3d; transform:translate3d(var(--x),var(--y),var(--z));
+  box-shadow:0 26px 60px rgba(0,0,0,.55);
+  transition:border-color .35s ease, box-shadow .35s ease;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.5rem;
+}
+.hop .dot{ width:10px; height:10px; border-radius:50%; background:var(--line-2); transition:background .3s ease, box-shadow .3s ease; }
+.hop .lbl{ font-family:var(--mono); font-size:.54rem; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-3); text-align:center; padding-inline:.5rem; }
+.hop .bars{ display:flex; gap:3px; align-items:flex-end; height:16px; }
+.hop .bars i{ width:3px; background:var(--line-2); border-radius:2px; transition:background .3s ease; }
+.hop .bars i:nth-child(1){ height:5px; } .hop .bars i:nth-child(2){ height:9px; }
+.hop .bars i:nth-child(3){ height:13px; } .hop .bars i:nth-child(4){ height:16px; }
+.hop.lit{ border-color:rgba(61,220,151,.75); box-shadow:0 26px 70px rgba(61,220,151,.16); }
+.hop.lit .dot{ background:var(--green); box-shadow:0 0 0 6px rgba(61,220,151,.16); }
+.hop.lit .bars i{ background:var(--green); }
+.hop.origin{ border-color:rgba(255,68,56,.7); }
+.hop.origin .dot{ background:var(--red); box-shadow:0 0 0 6px rgba(255,68,56,.16); }
+.hop.origin .bars i{ background:var(--red); }
+.packet{
+  position:absolute; top:50%; left:50%; width:13px; height:13px; margin:-6px 0 0 -6px;
+  border-radius:50%; background:var(--red);
+  box-shadow:0 0 0 5px rgba(255,68,56,.2), 0 0 26px 6px rgba(255,68,56,.5);
+  transform:translate3d(var(--px,0),var(--py,0),var(--pz,0));
+}
+.relay-cap{
+  margin-top:2.2rem; display:flex; flex-wrap:wrap; gap:1rem 2.4rem; align-items:baseline;
+}
+.relay-cap .step{ font-family:var(--mono); font-size:.68rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-3); }
+.relay-cap .step.on{ color:var(--green); }
+.relay-note{ color:var(--ink-2); font-size:.94rem; max-width:38em; margin-top:.9rem; }
+
+/* ---------- 3D phone ---------- */
+.app{ height:400vh; }
+.app-sticky{ position:sticky; top:0; height:100svh; display:grid; grid-template-columns:1fr 1fr; align-items:center; gap:3rem; overflow:hidden; }
+.app-copy h3{ font-size:clamp(1.6rem,2.6vw,2.3rem); margin-top:1.3rem; }
+.app-copy p{ color:var(--ink-2); margin-top:1rem; max-width:30em; font-size:.98rem; }
+.app-slide{ position:absolute; opacity:0; transform:translateY(16px); transition:opacity .5s ease, transform .5s ease; pointer-events:none; }
+.app-slide.on{ opacity:1; transform:none; position:relative; pointer-events:auto; }
+
+.phone-stage{ perspective:1500px; display:grid; place-items:center; }
+.phone-rig{ transform-style:preserve-3d; transform:rotateY(calc(26deg - var(--p,0)*30deg)) rotateX(calc(6deg - var(--p,0)*7deg)); transition:transform .12s linear; }
+.phone{
+  position:relative; width:288px; height:600px; border-radius:42px;
+  background:linear-gradient(155deg,#1b2434,#0a0e16);
+  border:1px solid var(--line-2); padding:11px;
+  box-shadow:0 50px 110px rgba(0,0,0,.7), inset 0 1px 0 rgba(255,255,255,.07);
+  transform-style:preserve-3d;
+}
+.phone::before{
+  content:""; position:absolute; top:20px; left:50%; translate:-50% 0;
+  width:88px; height:22px; border-radius:12px; background:#05070c; z-index:5;
+}
+.screen{
+  position:relative; width:100%; height:100%; border-radius:32px; overflow:hidden;
+  background:radial-gradient(120% 60% at 80% 0%, rgba(63,224,255,.10), transparent 60%), #070a11;
+}
+/* depth furniture floating behind the phone */
+.aura{
+  position:absolute; border-radius:20px; border:1px solid var(--line);
+  background:rgba(12,17,26,.55); backdrop-filter:blur(4px);
+  font-family:var(--mono); font-size:.58rem; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3);
+  padding:.7rem .9rem; transform-style:preserve-3d;
+}
+.aura.a1{ top:8%; left:-16%; transform:translateZ(-170px); }
+.aura.a2{ bottom:16%; right:-18%; transform:translateZ(-120px); }
+.aura.a3{ top:44%; right:-26%; transform:translateZ(-230px); }
+.aura b{ color:var(--cyan); font-weight:500; }
+
+/* phone screens */
+.scr{ position:absolute; inset:0; opacity:0; transition:opacity .45s ease; padding:34px 14px 12px; display:flex; flex-direction:column; }
+.scr.on{ opacity:1; }
+.scr-bar{ display:flex; align-items:center; gap:.5rem; padding:0 4px 10px; }
+.scr-bar .m{ width:12px; height:12px; border-radius:50%; border:1.5px solid var(--cyan); }
+.scr-bar .n{ font-family:var(--mono); font-size:.5rem; letter-spacing:.28em; color:var(--ink); }
+.scr-bar .p{ margin-left:auto; font-family:var(--mono); font-size:.45rem; letter-spacing:.1em; color:var(--green); border:1px solid rgba(61,220,151,.35); background:rgba(61,220,151,.1); border-radius:20px; padding:.25em .6em; }
+.eyeb{ font-family:var(--mono); font-size:.44rem; letter-spacing:.2em; text-transform:uppercase; color:var(--ink-3); }
+.ttl{ font-size:.95rem; font-weight:700; letter-spacing:-.02em; margin-top:.25rem; }
+.sub{ font-size:.55rem; color:var(--ink-3); margin-top:.15rem; }
+.fieldy{ margin-top:.7rem; border:1px solid var(--line); border-radius:11px; background:var(--card); padding:.6rem .65rem; font-size:.55rem; color:var(--ink-3); }
+.chips{ display:flex; gap:5px; margin-top:.55rem; }
+.chips i{ font-style:normal; font-size:.45rem; color:var(--ink-3); border:1px solid var(--line); border-radius:20px; padding:.3em .6em; background:var(--card); white-space:nowrap; }
+.beacon{ margin:.9rem auto .2rem; width:132px; height:132px; border-radius:50%; display:grid; place-items:center; position:relative;
+  background:radial-gradient(circle at 32% 28%, #ff5a4e, #8c1710); box-shadow:0 0 0 1px rgba(255,68,56,.6); }
+.beacon::before,.beacon::after{ content:""; position:absolute; inset:-16px; border-radius:50%; border:1px solid rgba(255,68,56,.45); animation:ring 2.6s ease-out infinite; }
+.beacon::after{ animation-delay:1.3s; }
+@keyframes ring{ 0%{ transform:scale(.86); opacity:.85; } 100%{ transform:scale(1.28); opacity:0; } }
+.beacon b{ font-size:.72rem; letter-spacing:.06em; }
+.rows{ margin-top:auto; border:1px solid var(--line); border-radius:12px; background:var(--card); padding:.6rem .7rem; }
+.row{ display:flex; justify-content:space-between; font-size:.5rem; padding:.28rem 0; }
+.row span:first-child{ color:var(--ink-3); }
+.row span:last-child{ font-family:var(--mono); }
+.g{ color:var(--green); } .c{ color:var(--cyan); } .a{ color:var(--amber); } .r{ color:var(--red); }
+.bub{ max-width:78%; border:1px solid var(--line); background:var(--card); border-radius:13px 13px 13px 4px; padding:.45rem .6rem; font-size:.55rem; margin-top:.5rem; }
+.bub.me{ margin-left:auto; border-radius:13px 13px 4px 13px; border-color:rgba(63,224,255,.4); background:linear-gradient(135deg,rgba(63,224,255,.2),rgba(63,224,255,.07)); }
+.bub small{ display:block; font-family:var(--mono); font-size:.4rem; color:var(--ink-3); margin-top:.28rem; }
+.pinr{ display:flex; gap:.5rem; align-items:center; border:1px solid var(--line); background:var(--card); border-radius:12px; padding:.5rem .55rem; margin-top:.5rem; }
+.pinr .ic{ width:26px; height:26px; border-radius:8px; display:grid; place-items:center; font-size:.6rem; flex:none; }
+.pinr .tx{ flex:1; min-width:0; }
+.pinr .tx b{ display:block; font-size:.55rem; font-weight:600; }
+.pinr .tx span{ font-size:.44rem; color:var(--ink-3); font-family:var(--mono); }
+.pinr .ds{ font-family:var(--mono); font-size:.5rem; text-align:right; }
+.radar-mini{ position:relative; width:150px; height:150px; margin:1rem auto .4rem; border-radius:50%; border:1px solid var(--line); }
+.radar-mini::before{ content:""; position:absolute; inset:22%; border-radius:50%; border:1px solid var(--line); }
+.radar-mini .sw{ position:absolute; inset:0; border-radius:50%; background:conic-gradient(from 0deg, transparent 0deg, transparent 250deg, rgba(61,220,151,.28) 360deg); animation:spin 3.4s linear infinite; }
+@keyframes spin{ to{ transform:rotate(360deg); } }
+.radar-mini .bl{ position:absolute; width:7px; height:7px; border-radius:50%; }
+.nav-mini{ margin-top:auto; display:flex; gap:3px; border:1px solid var(--line); background:rgba(12,17,26,.9); border-radius:16px; padding:5px; }
+.nav-mini div{ flex:1; text-align:center; font-family:var(--mono); font-size:.4rem; letter-spacing:.1em; color:var(--ink-3); padding:.42rem 0; border-radius:12px; }
+.nav-mini div.on{ background:rgba(63,224,255,.14); color:var(--cyan); }
+
+/* ---------- packet anatomy ---------- */
+.anat{ height:320vh; }
+.anat-sticky{ position:sticky; top:0; height:100svh; display:grid; grid-template-columns:1fr 1fr; align-items:center; gap:3rem; overflow:hidden; }
+.slab-stage{ perspective:1300px; display:grid; place-items:center; }
+.slabs{ position:relative; width:340px; height:340px; transform-style:preserve-3d;
+  transform:rotateX(58deg) rotateZ(calc(-32deg + var(--p,0)*22deg)); transition:transform .12s linear; }
+.slab{
+  position:absolute; inset:0; border-radius:14px; border:1px solid var(--sc,var(--line-2));
+  background:linear-gradient(140deg, rgba(18,24,38,.94), rgba(8,11,18,.9));
+  transform:translateZ(calc(var(--i) * var(--p,0) * var(--sep,62px)));
+  transition:transform .12s linear, border-color .3s ease;
+  display:flex; flex-direction:column; justify-content:flex-end; padding:14px 16px;
+  box-shadow:0 14px 40px rgba(0,0,0,.4);
+}
+.slab b{ font-family:var(--mono); font-size:.72rem; letter-spacing:.16em; text-transform:uppercase; color:var(--sc,var(--ink-2)); }
+.slab span{ font-size:.7rem; color:var(--ink-2); margin-top:.25rem; }
+.anat-list{ list-style:none; display:grid; gap:0; }
+.anat-list li{ border-top:1px solid var(--line); padding:1.15rem .2rem; display:grid; grid-template-columns:auto 1fr; gap:1rem; transition:background .35s ease, padding-left .35s ease; }
+.anat-list li:last-child{ border-bottom:1px solid var(--line); }
+.anat-list li.on{ background:rgba(63,224,255,.045); padding-left:.7rem; }
+.anat-list .k{ font-family:var(--mono); font-size:.6rem; letter-spacing:.1em; color:var(--ink-3); padding-top:.28rem; }
+.anat-list li.on .k{ color:var(--cyan); }
+.anat-list h4{ font-size:1rem; font-weight:600; letter-spacing:-.01em; }
+.anat-list p{ color:var(--ink-3); font-size:.88rem; margin-top:.25rem; max-width:30em; }
+
+/* ---------- security grid ---------- */
+.sec-grid{ margin-top:7vh; display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.cellb{ background:var(--night); padding:2.1rem 1.7rem 2.3rem; position:relative; overflow:hidden; transition:background .4s ease; }
+.cellb:hover{ background:var(--pool); }
+.cellb::after{ content:""; position:absolute; inset:0 auto auto 0; width:100%; height:2px; background:linear-gradient(90deg,var(--ac,var(--cyan)),transparent 72%); transform:scaleX(0); transform-origin:0 50%; transition:transform .55s cubic-bezier(.2,.6,.2,1); }
+.cellb:hover::after{ transform:scaleX(1); }
+.cellb .k{ font-family:var(--mono); font-size:.6rem; letter-spacing:.18em; text-transform:uppercase; color:var(--ac,var(--cyan)); }
+.cellb h4{ font-size:1.06rem; font-weight:600; margin-top:1rem; letter-spacing:-.01em; }
+.cellb p{ color:var(--ink-3); font-size:.88rem; margin-top:.6rem; }
+
+/* ---------- honesty ---------- */
+.honest{ border-block:1px solid var(--line); background:linear-gradient(180deg,var(--void),var(--night)); margin-top:16vh; padding-block:14vh; }
+.honest h2{ font-size:clamp(2.1rem,4.6vw,3.6rem); margin-top:1.5rem; max-width:15em; }
+.honest h2 em{ font-style:normal; color:var(--amber); }
+.honest-grid{ margin-top:6vh; display:grid; grid-template-columns:repeat(2,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.no{ background:var(--night); padding:2rem 1.8rem; }
+.no .x{ font-family:var(--mono); color:var(--amber); font-size:.85rem; }
+.no h4{ font-size:1.02rem; font-weight:600; margin-top:.8rem; }
+.no p{ color:var(--ink-3); font-size:.88rem; margin-top:.5rem; }
+
+/* ---------- numbers ---------- */
+.nums{ padding-block:14vh; }
+.nums-grid{ margin-top:6vh; display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.num{ background:var(--night); padding:2.6rem 1.6rem; transition:background .4s ease; }
+.num:hover{ background:var(--pool); }
+.num b{ display:block; font-family:var(--mono); font-weight:500; font-size:clamp(2.1rem,3.6vw,3.1rem); letter-spacing:-.03em; color:var(--ink); font-variant-numeric:tabular-nums; }
+.num b small{ font-size:.42em; color:var(--cyan); }
+.num p{ margin-top:.9rem; color:var(--ink-3); font-size:.86rem; }
+
+/* ---------- finale ---------- */
+.finale{
+  position:relative; overflow:hidden; text-align:center;
+  border-top:1px solid var(--line);
+  background:radial-gradient(90% 100% at 50% 118%, rgba(255,68,56,.14), transparent 62%), var(--void);
+  padding-block:17vh 15vh;
+}
+.finale .eyebrow{ justify-content:center; }
+.finale .eyebrow::before{ display:none; }
+.finale h2{ font-size:clamp(2.6rem,7vw,5.8rem); margin-top:1.6rem; }
+.finale h2 em{ font-style:normal; color:var(--red); }
+.finale p{ margin:1.8rem auto 0; }
+.finale .cta-row{ justify-content:center; opacity:1; }
+
+/* ---------- footer ---------- */
+footer{ border-top:1px solid var(--line); background:var(--void); padding-block:4.5rem 2.6rem; }
+.foot{ display:grid; grid-template-columns:2fr 1fr 1fr; gap:3rem; }
+.foot p{ color:var(--ink-3); font-size:.86rem; max-width:26em; margin-top:1.2rem; }
+.foot h5{ font-family:var(--mono); font-size:.62rem; letter-spacing:.24em; text-transform:uppercase; color:var(--ink-3); font-weight:400; margin-bottom:1.2rem; }
+.foot ul{ list-style:none; display:grid; gap:.65rem; }
+.foot a{ color:var(--ink-2); font-size:.9rem; transition:color .3s; }
+.foot a:hover{ color:var(--cyan); }
+.foot-base{
+  margin-top:4rem; padding-top:1.8rem; border-top:1px solid var(--line);
+  display:flex; flex-wrap:wrap; gap:1rem; justify-content:space-between;
+  font-family:var(--mono); font-size:.62rem; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3);
+}
+
+/* ---------- responsive ---------- */
+@media (max-width:1020px){
+  .app-sticky,.anat-sticky{ grid-template-columns:1fr; gap:1.5rem; }
+  .app-copy,.anat-copy{ order:2; }
+  .phone-stage,.slab-stage{ order:1; }
+  .phone{ width:216px; height:452px; border-radius:34px; }
+  .screen{ border-radius:26px; }
+  .aura{ display:none; }
+  .slabs{ width:250px; height:250px; --sep:38px; }
+  .rail{ --rail-x:-24px; --rail-s:.78; }
+  .sec-grid{ grid-template-columns:1fr 1fr; }
+  .nums-grid{ grid-template-columns:1fr 1fr; }
+  .hero-strip{ grid-template-columns:1fr 1fr; }
+}
+@media (max-width:720px){
+  .nav-links{ display:none; }
+  .honest-grid{ grid-template-columns:1fr; }
+  .sec-grid{ grid-template-columns:1fr; }
+  .foot{ grid-template-columns:1fr; gap:2.2rem; }
+  .relay{ height:280vh; }
+  .app{ height:340vh; }
+  .app-sticky{ align-content:center; }
+  .scr{ padding:26px 10px 10px; }
+  .rail{ --rail-x:0px; --rail-s:.52; }
+  .slabs{ width:210px; height:210px; --sep:26px; }
+}
+@media (max-width:520px){
+  .nums-grid{ grid-template-columns:1fr; }
+  .hero-strip{ grid-template-columns:1fr; }
+}
+
+/* ---------- reduced motion ---------- */
+@media (prefers-reduced-motion: reduce){
+  html{ scroll-behavior:auto; }
+  *,*::before,*::after{ animation:none !important; transition:none !important; }
+  .hl-line i{ transform:none; }
+  .hero .lede,.cta-row,.hero-strip,.cue,#lattice{ opacity:1; transform:none; }
+  .js .rv{ opacity:1; transform:none; }
+  .thesis .w{ color:var(--ink); }
+  .rail,.phone-rig,.slabs{ transform:none; }
+  .slab{ position:relative; inset:auto; transform:none; margin-bottom:8px; }
+  .slabs{ height:auto; }
+  .scr{ opacity:1; position:relative; }
+  .scr:not(.on){ display:none; }
+}
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress" aria-hidden="true"></div>
+
+<nav id="nav" aria-label="Primary">
+  <div class="nav-in">
+    <a class="brand" href="#top" aria-label="MeshLine — home">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="2.4" fill="#3fe0ff"/>
+        <path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7" stroke="#ff4438" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+        <path d="M6 18a8.5 8.5 0 0 1 0-12M18 6a8.5 8.5 0 0 1 0 12" stroke="#3fe0ff" stroke-width="1.5" fill="none" stroke-linecap="round" opacity=".6"/>
+      </svg>
+      <b>MESHLINE</b>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#relay">The relay</a></li>
+      <li><a href="#app">The app</a></li>
+      <li><a href="#anatomy">A packet</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#limits">Limits</a></li>
+    </ul>
+    <a class="nav-cta" href="#get">Get MeshLine</a>
+  </div>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <canvas id="lattice" aria-hidden="true"></canvas>
+  <div class="wrap hero-in">
+    <p class="eyebrow">MeshLine &nbsp;·&nbsp; offline mesh communication</p>
+    <h1 class="hl">
+      <span class="hl-line"><i>When everything</i></span>
+      <span class="hl-line"><i>else goes down,</i></span>
+      <span class="hl-line"><i>your phone still <em>talks.</em></i></span>
+    </h1>
+    <p class="lede">MeshLine hops emergency messages directly between nearby phones over Bluetooth LE — no cell tower, no internet, no SIM, no server, no account. Every packet is signed before it is read. Every private word is end-to-end encrypted, including the ones your phone carries for a stranger.</p>
+    <div class="cta-row">
+      <a class="btn btn-solid" href="#relay">See how a message travels <span class="arr">→</span></a>
+      <a class="btn btn-ghost" href="#security">Read the security model</a>
+    </div>
+
+    <div class="hero-strip">
+      <div class="hs"><b>0</b><span>servers, accounts, or analytics</span></div>
+      <div class="hs"><b>8</b><span>hops before a packet is dropped</span></div>
+      <div class="hs"><b>Noise-XX</b><span>mutual handshake, Ed25519-bound</span></div>
+      <div class="hs"><b>100%</b><span>on device, including the history</span></div>
+    </div>
+  </div>
+
+  <div class="cue" aria-hidden="true"><span>Scroll</span><span class="stem"></span></div>
+</header>
+
+<!-- ================= TICKER ================= -->
+<div class="ticker" aria-hidden="true">
+  <div class="tick-track" id="tick">
+    <span><b>No tower</b><i>✦</i><b>No internet</b><i>✦</i><b>No SIM</b><i>✦</i><b>No server</b><i>✦</i><b>No account</b><i>✦</i><b>No plaintext fallback</b><i>✦</i></span>
+  </div>
+</div>
+
+<!-- ================= THESIS ================= -->
+<section class="thesis" id="thesis">
+  <div class="thesis-sticky">
+    <div class="wrap">
+      <p class="eyebrow red" style="margin-bottom:2.4rem">The failure nobody plans for</p>
+      <p id="thesis-text">A disaster does not only take the roads. It takes the <em>towers.</em> And the moment a tower is gone, a phone with a full battery and a clear line of sight to a hundred other phones becomes a torch. MeshLine gives those phones back to each other — <em>directly,</em> one to the next, until a message reaches somebody who can act on it.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= RELAY ================= -->
+<section class="relay" id="relay">
+  <div class="relay-sticky">
+    <div class="wrap">
+      <p class="eyebrow green">How a message travels</p>
+      <h2 style="font-size:clamp(1.7rem,3.4vw,2.6rem); margin-top:1rem;">Every phone in range is a relay.</h2>
+
+      <div class="stage">
+        <div class="rail" id="rail">
+          <div class="hop origin" style="--x:-320px;--y:8px;--z:-210px">
+            <div class="dot"></div><div class="bars"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl">You<br>SOS signed</div>
+          </div>
+          <div class="hop" style="--x:-160px;--y:-14px;--z:-90px">
+            <div class="dot"></div><div class="bars"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl">Stranger<br>verify · relay</div>
+          </div>
+          <div class="hop" style="--x:0px;--y:10px;--z:20px">
+            <div class="dot"></div><div class="bars"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl">Neighbour<br>ttl 6 · carried</div>
+          </div>
+          <div class="hop" style="--x:160px;--y:-12px;--z:120px">
+            <div class="dot"></div><div class="bars"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl">Shelter<br>duplicate dropped</div>
+          </div>
+          <div class="hop" style="--x:320px;--y:6px;--z:230px">
+            <div class="dot"></div><div class="bars"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl">Responder<br>read</div>
+          </div>
+          <div class="packet" id="packet" aria-hidden="true"></div>
+        </div>
+      </div>
+
+      <div class="relay-cap" id="relay-steps">
+        <span class="step">01 · sign</span>
+        <span class="step">02 · verify</span>
+        <span class="step">03 · carry</span>
+        <span class="step">04 · dedupe</span>
+        <span class="step">05 · arrive</span>
+      </div>
+      <p class="relay-note">Nothing is trusted on arrival. Each phone checks the sender's Ed25519 signature <b>before</b> anything else touches the packet, drops what it has already seen, decrements the hop count, and passes on what is left. A relay carries ciphertext it cannot read, and cannot alter a packet without invalidating it.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= THE APP ================= -->
+<section class="app" id="app">
+  <div class="app-sticky wrap">
+    <div class="app-copy">
+      <p class="eyebrow">The app</p>
+      <div style="position:relative">
+        <div class="app-slide on" data-slide="0">
+          <h3>One button that means help.</h3>
+          <p>Write what happened, tap once. The SOS is broadcast in the clear — deliberately, so any stranger in range can read it and come — with your coordinates attached if a fix is available, and one-tap phrases for when your hands are shaking. Proof-of-work keeps the channel from being flooded.</p>
+        </div>
+        <div class="app-slide" data-slide="1">
+          <h3>Private words stay private.</h3>
+          <p>Direct chats run a mutual Noise-XX handshake, with each side's key signed by a long-lived mesh identity. Groups get a key delivered inside an already-established pairwise session, so nobody joins without a completed handshake. Until you compare safety numbers in person, the app says <em>unverified</em> rather than showing you a tick.</p>
+        </div>
+        <div class="app-slide" data-slide="2">
+          <h3>Water, shelter, hazards — signed.</h3>
+          <p>Every pin carries its own creator signature and an expiry, verified independently of whichever phone relayed it. They are listed by distance and true bearing rather than drawn on a map, because a fabricated basemap in a disaster app is an invitation to navigate by it.</p>
+        </div>
+        <div class="app-slide" data-slide="3">
+          <h3>See exactly who is carrying for you.</h3>
+          <p>The radar plots only devices that have exchanged authenticated packets with this phone, at their measured signal strength. An empty radar means an empty radar. And when a device has to be surrendered, panic wipe destroys every session key, group key, and stored message — while keeping the identity your verified contacts recognise.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="phone-stage">
+      <div class="phone-rig" id="rig">
+        <div class="aura a1">relay <b>active</b></div>
+        <div class="aura a2">ttl <b>8 → 0</b></div>
+        <div class="aura a3">noise_xx <b>ok</b></div>
+        <div class="phone">
+          <div class="screen">
+
+            <!-- SOS -->
+            <div class="scr on" data-scr="0">
+              <div class="scr-bar"><span class="m"></span><span class="n">MESHLINE</span><span class="p">3 devices</span></div>
+              <div class="eyeb">Emergency broadcast</div>
+              <div class="ttl">Send an SOS</div>
+              <div class="sub">Phone to phone, no tower and no internet</div>
+              <div class="fieldy">Two people trapped, second floor, need medical help</div>
+              <div class="chips"><i>People trapped</i><i>Medical help</i><i>Fire</i></div>
+              <div class="beacon"><b>SEND SOS</b></div>
+              <div class="rows">
+                <div class="row"><span>Your position</span><span class="c">12.9716, 77.5946</span></div>
+                <div class="row"><span>Devices in range</span><span class="g">3</span></div>
+                <div class="row"><span>Secure core</span><span class="g">Active</span></div>
+                <div class="row"><span>Carrying for the mesh</span><span class="c">4 packets</span></div>
+              </div>
+              <div class="nav-mini"><div class="on">SOS</div><div>CHAT</div><div>PINS</div><div>RADAR</div></div>
+            </div>
+
+            <!-- CHAT -->
+            <div class="scr" data-scr="1">
+              <div class="scr-bar"><span class="m"></span><span class="n">MESHLINE</span><span class="p">3 devices</span></div>
+              <div class="eyeb">Mesh chat</div>
+              <div class="ttl">Ward 4 crew</div>
+              <div class="sub" style="color:#3ddc97">Private group · encrypted to 5 members</div>
+              <div class="chips" style="margin-top:.6rem"><i>Public</i><i style="border-color:rgba(61,220,151,.5);color:#3ddc97">Ward 4 crew</i><i>node-7f2c</i></div>
+              <div class="bub">Tanker reached the school gate.<small>10:42 · encrypted</small></div>
+              <div class="bub me">Copy. Sending two people over now.<small>10:43 · encrypted · relayed</small></div>
+              <div class="bub">Second floor stairwell is blocked — go round the east side.<small>10:44 · encrypted</small></div>
+              <div class="fieldy" style="margin-top:auto">Message</div>
+              <div class="nav-mini"><div>SOS</div><div class="on">CHAT</div><div>PINS</div><div>RADAR</div></div>
+            </div>
+
+            <!-- PINS -->
+            <div class="scr" data-scr="2">
+              <div class="scr-bar"><span class="m"></span><span class="n">MESHLINE</span><span class="p">3 devices</span></div>
+              <div class="eyeb">Signed resource pins</div>
+              <div class="ttl">What is around you</div>
+              <div class="sub">Bearings from 12.9716, 77.5946</div>
+              <div class="pinr"><div class="ic" style="background:rgba(63,224,255,.14);color:#3fe0ff">◆</div><div class="tx"><b>Water tanker at school gate</b><span>signed by 7f2c9a13</span></div><div class="ds"><span class="c">180 m</span><br><span style="color:#6e7a92">NE</span></div></div>
+              <div class="pinr"><div class="ic" style="background:rgba(61,220,151,.14);color:#3ddc97">▲</div><div class="tx"><b>Dry shelter, community hall</b><span>signed by a41f0b77</span></div><div class="ds"><span class="g">420 m</span><br><span style="color:#6e7a92">E</span></div></div>
+              <div class="pinr"><div class="ic" style="background:rgba(255,68,56,.14);color:#ff4438">✚</div><div class="tx"><b>Medical post, 2 nurses</b><span>signed by 09be4d21</span></div><div class="ds"><span class="r">1.1 km</span><br><span style="color:#6e7a92">SW</span></div></div>
+              <div class="pinr"><div class="ic" style="background:rgba(255,180,67,.14);color:#ffb443">■</div><div class="tx"><b>Bridge road impassable</b><span>signed by 5c7a2e08</span></div><div class="ds"><span class="a">640 m</span><br><span style="color:#6e7a92">N</span></div></div>
+              <div class="nav-mini" style="margin-top:auto"><div>SOS</div><div>CHAT</div><div class="on">PINS</div><div>RADAR</div></div>
+            </div>
+
+            <!-- RADAR -->
+            <div class="scr" data-scr="3">
+              <div class="scr-bar"><span class="m"></span><span class="n">MESHLINE</span><span class="p">3 devices</span></div>
+              <div class="eyeb">Mesh radar</div>
+              <div class="ttl">Who is carrying for you</div>
+              <div class="sub">Devices exchanging verified traffic</div>
+              <div class="radar-mini">
+                <div class="sw"></div>
+                <span class="bl" style="background:#3ddc97;left:62%;top:28%"></span>
+                <span class="bl" style="background:#ffb443;left:31%;top:58%"></span>
+                <span class="bl" style="background:#3ddc97;left:70%;top:66%"></span>
+                <span class="bl" style="background:#3fe0ff;left:calc(50% - 3px);top:calc(50% - 3px)"></span>
+              </div>
+              <div class="rows" style="margin-top:.4rem">
+                <div class="row"><span>node-7f2c9a13</span><span class="g">verified</span></div>
+                <div class="row"><span>node-a41f0b77</span><span class="a">unverified</span></div>
+                <div class="row"><span>node-09be4d21</span><span class="g">verified</span></div>
+              </div>
+              <div class="nav-mini" style="margin-top:auto"><div>SOS</div><div>CHAT</div><div>PINS</div><div class="on">RADAR</div></div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= PACKET ANATOMY ================= -->
+<section class="anat" id="anatomy">
+  <div class="anat-sticky wrap">
+    <div class="anat-copy">
+      <p class="eyebrow violet">Inside one packet</p>
+      <h2 style="font-size:clamp(1.7rem,3.4vw,2.6rem); margin-top:1rem;">Four layers, checked in that order.</h2>
+      <ul class="anat-list" id="anat-list">
+        <li><span class="k">01</span><div><h4>Signature</h4><p>Ed25519 over the immutable header and payload. <code>Packet::verify()</code> runs before any other processing on receive — nothing unsigned reaches a parser.</p></div></li>
+        <li><span class="k">02</span><div><h4>Identity binding</h4><p><code>sender_id</code> must equal <code>SHA-256(pubkey)[..16]</code>, so an attacker cannot attach their own key and claim to be somebody else.</p></div></li>
+        <li><span class="k">03</span><div><h4>Mutable header</h4><p>TTL and flags are excluded from the signed bytes, because relays have to change them. Signatures therefore survive every hop untouched.</p></div></li>
+        <li><span class="k">04</span><div><h4>Ciphertext</h4><p>ChaCha20-Poly1305 under a Noise-XX session, or XChaCha20-Poly1305 under a group key. The relay carries it; the relay cannot read it.</p></div></li>
+      </ul>
+    </div>
+    <div class="slab-stage">
+      <div class="slabs" id="slabs">
+        <div class="slab" style="--i:3;--sc:#9b8cff"><b>Signature</b><span>64 bytes · Ed25519</span></div>
+        <div class="slab" style="--i:2;--sc:#3fe0ff"><b>Sender identity</b><span>32-byte key · 16-byte id</span></div>
+        <div class="slab" style="--i:1;--sc:#ffb443"><b>Mutable header</b><span>ttl · flags · unsigned</span></div>
+        <div class="slab" style="--i:0;--sc:#3ddc97"><b>Ciphertext</b><span>AEAD · opaque to relays</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SECURITY ================= -->
+<section id="security">
+  <div class="wrap sec-head">
+    <p class="eyebrow rv">The security model</p>
+    <h2 class="rv" style="--d:.08s">The mesh is a <em>hostile medium.</em></h2>
+    <p class="lede rv" style="--d:.16s">Anyone in radio range can transmit anything. So MeshLine treats every arriving byte as an attack until it proves otherwise — and refuses to send at all rather than fall back to plaintext.</p>
+
+    <div class="sec-grid">
+      <div class="cellb rv" style="--ac:#9b8cff"><span class="k">Authenticity</span><h4>Verify before anything else</h4><p>Signature, then freshness window, then proof-of-work, then rate limit — in that order, on every packet, before a single field is acted on.</p></div>
+      <div class="cellb rv" style="--ac:#3fe0ff;--d:.06s"><span class="k">Confidentiality</span><h4>Noise_XX_25519_ChaChaPoly</h4><p>Each side's Noise static key is signed by its mesh identity, so a session is bound to a known node rather than to whoever answered.</p></div>
+      <div class="cellb rv" style="--ac:#3ddc97;--d:.12s"><span class="k">Groups</span><h4>No membership without a handshake</h4><p>The group key travels inside an existing pairwise session. Removing a member rotates the key and bumps the epoch, so they can read nothing sent afterwards.</p></div>
+      <div class="cellb rv" style="--ac:#ffb443"><span class="k">Replay</span><h4>Nonces, windows, and an LRU</h4><p>Per-message nonces with a sliding window, a duplicate cache, and a freshness bound — so a recorded packet cannot be played back into the crowd.</p></div>
+      <div class="cellb rv" style="--ac:#ff4438;--d:.06s"><span class="k">At rest</span><h4>Hardware-backed, and destroyable</h4><p>Identity, session keys, group keys, and history are sealed under Android Keystore keys and excluded from backup. Panic wipe removes all of it in one action.</p></div>
+      <div class="cellb rv" style="--ac:#3fe0ff;--d:.12s"><span class="k">Pre-auth input</span><h4>Bounded on every axis</h4><p>Fragment reassembly happens before a signature can be checked, so it is capped by count, size, concurrency per peer and in total, and by a timeout. A noisy peer cannot evict a quiet one's part-built packet.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= LIMITS ================= -->
+<section class="honest" id="limits">
+  <div class="wrap">
+    <p class="eyebrow amber rv">Being straight about this</p>
+    <h2 class="rv" style="--d:.08s">What MeshLine <em>will not</em> do.</h2>
+    <p class="lede rv" style="--d:.16s">A longer feature list would be easy to write. These are the things you would otherwise assume while standing in the middle of an emergency, so they are stated here, in the app, and in the store listing.</p>
+
+    <div class="honest-grid">
+      <div class="no rv"><span class="x">✕</span><h4>It is not a satellite messenger</h4><p>Bluetooth LE only in this release. Range is tens of metres, extended only by other phones running MeshLine. No LoRa, no Wi-Fi Direct.</p></div>
+      <div class="no rv" style="--d:.06s"><span class="x">✕</span><h4>Delivery is best effort</h4><p>Nothing guarantees an SOS reaches anyone. With no phone in range your message waits on your device and goes out the moment one appears.</p></div>
+      <div class="no rv" style="--d:.12s"><span class="x">✕</span><h4>A public SOS is readable by anyone</h4><p>Deliberately. That is exactly what lets a stranger in range act on it. Private chats and groups are encrypted; a distress broadcast is not.</p></div>
+      <div class="no rv" style="--d:.18s"><span class="x">✕</span><h4>First contact is trust-on-first-use</h4><p>An attacker present at the very first handshake is authenticated to both sides. Comparing safety numbers in person is the only thing that detects it, which is why the app keeps asking.</p></div>
+      <div class="no rv" style="--d:.24s"><span class="x">✕</span><h4>Traffic analysis is not defeated</h4><p>A group's messages carry a tag derived from its key. It is opaque and rotates on rekey, but within an epoch an observer with a radio can count a group's traffic.</p></div>
+      <div class="no rv" style="--d:.3s"><span class="x">✕</span><h4>There is no offline basemap</h4><p>Pins give distance and true bearing rather than a map. Shipping a fabricated basemap in a disaster app invites someone to navigate by it.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= NUMBERS ================= -->
+<section class="nums">
+  <div class="wrap">
+    <p class="eyebrow rv">The measure of it</p>
+    <div class="nums-grid">
+      <div class="num rv"><b><span data-count data-to="8">0</span></b><p>hops before a packet is dropped — roughly seven devices between you and the far end.</p></div>
+      <div class="num rv" style="--d:.06s"><b><span data-count data-to="0">0</span></b><p>servers, accounts, trackers, or analytics. Nothing to breach, because nothing is collected.</p></div>
+      <div class="num rv" style="--d:.12s"><b><span data-count data-to="60">0</span></b><p>digits in a safety number, compared in person, because that is what a radio cannot do for you.</p></div>
+      <div class="num rv" style="--d:.18s"><b><span data-count data-to="2000">0</span></b><p>most recent messages kept, encrypted under a hardware-backed key, and wipeable in one action.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FINALE ================= -->
+<section class="finale" id="get">
+  <div class="wrap">
+    <p class="eyebrow red">Carry it before you need it</p>
+    <h2>Install it on a <em>calm day.</em></h2>
+    <p class="lede">MeshLine is only as strong as the number of phones running it nearby. It costs nothing to carry and asks nothing of you until the day it matters — no account, no sign-in, no network. Android 8.0 and above.</p>
+    <div class="cta-row">
+      <a class="btn btn-solid" href="https://play.google.com/store/apps/details?id=org.meshline.app">Get it on Google Play <span class="arr">→</span></a>
+      <a class="btn btn-ghost" href="#limits">Read the limits first</a>
+    </div>
+    <p style="margin-top:2rem;font-family:var(--mono);font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3)">Built in India by Prahari Labs</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <a class="brand" href="#top">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="2.4" fill="#3fe0ff"/>
+            <path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7" stroke="#ff4438" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+            <path d="M6 18a8.5 8.5 0 0 1 0-12M18 6a8.5 8.5 0 0 1 0 12" stroke="#3fe0ff" stroke-width="1.5" fill="none" stroke-linecap="round" opacity=".6"/>
+          </svg>
+          <b>MESHLINE</b>
+        </a>
+        <p>Offline disaster communication. A Rust security core, a Jetpack Compose interface, and no plaintext fallback anywhere. An instrument of Prahari Labs.</p>
+      </div>
+      <div>
+        <h5>The app</h5>
+        <ul>
+          <li><a href="#relay">How relaying works</a></li>
+          <li><a href="#security">Security model</a></li>
+          <li><a href="#limits">What it will not do</a></li>
+          <li><a href="#get">Get MeshLine</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Prahari Labs</h5>
+        <ul>
+          <li><a href="https://praharilabs.com">The other instruments</a></li>
+          <li><a href="privacy.html">Privacy policy</a></li>
+          <li><a href="mailto:hello@praharilabs.com">Write to us</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 Prahari Labs · Made in India</span>
+      <span>No tower · No server · No account</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var doc = document.documentElement;
+  doc.classList.add('js');
+  var RM = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function clamp(v,a,b){ return v < a ? a : (v > b ? b : v); }
+  function seg(p,a,b){ return clamp((p-a)/(b-a), 0, 1); }
+
+  window.addEventListener('load', function(){ document.body.classList.add('loaded'); });
+  setTimeout(function(){ document.body.classList.add('loaded'); }, 800);
+
+  /* ---------- ticker: duplicate for a seamless loop ---------- */
+  var tick = document.getElementById('tick');
+  if (tick) tick.innerHTML = tick.innerHTML + tick.innerHTML + tick.innerHTML + tick.innerHTML;
+
+  /* ======================================================================
+     HERO — a real 3D lattice, perspective-projected on canvas.
+     Nodes live in a box, the box turns, and packets travel the edges. The
+     rotation also answers to scroll and to the pointer, so the depth reads
+     as depth rather than as a flat animation.
+     ====================================================================== */
+  var cv = document.getElementById('lattice');
+  var heroEl = document.querySelector('.hero');
+  var ctx = null, W = 0, H = 0, DPR = 1;
+  var nodes = [], edges = [], packets = [];
+  var pointerX = 0, pointerY = 0, heroVisible = true;
+
+  function buildLattice(){
+    if (!cv || !heroEl) return;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = heroEl.clientWidth; H = heroEl.clientHeight;
+    cv.width = W * DPR; cv.height = H * DPR;
+    ctx = cv.getContext('2d');
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var count = W < 700 ? 26 : (W < 1100 ? 40 : 56);
+    var spread = Math.min(W, 1500) * 0.42;
+    nodes = [];
+    for (var i = 0; i < count; i++){
+      nodes.push({
+        x: (Math.random() - 0.5) * spread * 2,
+        y: (Math.random() - 0.5) * spread * 1.15,
+        z: (Math.random() - 0.5) * spread * 1.5,
+        r: Math.random() < 0.14 ? 3.0 : 1.7,
+        hub: Math.random() < 0.14,
+        pulse: Math.random() * Math.PI * 2
+      });
+    }
+
+    // Connect near neighbours only — the shape of an actual radio mesh, not
+    // a fully-connected graph.
+    edges = [];
+    var reach = spread * 0.55;
+    for (var a = 0; a < nodes.length; a++){
+      for (var b = a + 1; b < nodes.length; b++){
+        var dx = nodes[a].x - nodes[b].x, dy = nodes[a].y - nodes[b].y, dz = nodes[a].z - nodes[b].z;
+        var d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (d < reach) edges.push({ a: a, b: b, d: d });
+      }
+    }
+    packets = [];
+  }
+
+  function spawnPacket(){
+    if (!edges.length) return;
+    var e = edges[(Math.random() * edges.length) | 0];
+    packets.push({
+      e: e,
+      t: 0,
+      speed: 0.006 + Math.random() * 0.009,
+      sos: Math.random() < 0.22
+    });
+  }
+
+  function project(n, cos, sin, tiltCos, tiltSin, cx, cy, focal){
+    // rotate around Y, then a small tilt around X
+    var x = n.x * cos - n.z * sin;
+    var z = n.x * sin + n.z * cos;
+    var y = n.y * tiltCos - z * tiltSin;
+    z = n.y * tiltSin + z * tiltCos;
+    var s = focal / (focal + z + 900);
+    return { x: cx + x * s, y: cy + y * s, s: s, z: z };
+  }
+
+  var scrollTurn = 0;
+
+  function drawLattice(time){
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+
+    var angle = (RM ? 0.6 : time * 0.000045) + scrollTurn;
+    var tilt = -0.12 + pointerY * 0.16;
+    var cos = Math.cos(angle), sin = Math.sin(angle);
+    var tc = Math.cos(tilt), ts = Math.sin(tilt);
+    var cx = W * (W < 900 ? 0.5 : 0.68) + pointerX * 30;
+    var cy = H * 0.5;
+    var focal = 900;
+
+    var pts = new Array(nodes.length);
+    for (var i = 0; i < nodes.length; i++) pts[i] = project(nodes[i], cos, sin, tc, ts, cx, cy, focal);
+
+    // edges
+    for (var k = 0; k < edges.length; k++){
+      var pa = pts[edges[k].a], pb = pts[edges[k].b];
+      var depth = (pa.s + pb.s) / 2;
+      var alpha = clamp((depth - 0.34) * 0.94, 0, 0.5);
+      if (alpha <= 0.005) continue;
+      ctx.strokeStyle = 'rgba(63,224,255,' + alpha.toFixed(3) + ')';
+      ctx.lineWidth = Math.max(0.5, depth * 1.1);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    }
+
+    // nodes
+    for (var j = 0; j < nodes.length; j++){
+      var p = pts[j], n = nodes[j];
+      var a = clamp((p.s - 0.3) * 1.85, 0, 1);
+      if (a <= 0.01) continue;
+      var tw = RM ? 1 : (0.78 + 0.22 * Math.sin(time * 0.0013 + n.pulse));
+      var rad = n.r * p.s * 1.9;
+      if (n.hub){
+        ctx.fillStyle = 'rgba(63,224,255,' + (a * 0.2).toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(p.x, p.y, rad * 4.6, 0, 6.2832); ctx.fill();
+      }
+      ctx.fillStyle = n.hub
+        ? 'rgba(63,224,255,' + (a * tw).toFixed(3) + ')'
+        : 'rgba(215,228,243,' + (a * tw * 0.9).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(p.x, p.y, rad, 0, 6.2832); ctx.fill();
+    }
+
+    // packets in flight
+    for (var q = packets.length - 1; q >= 0; q--){
+      var pk = packets[q];
+      pk.t += RM ? 0 : pk.speed;
+      if (pk.t >= 1){ packets.splice(q, 1); continue; }
+      var s = pts[pk.e.a], t = pts[pk.e.b];
+      var x = s.x + (t.x - s.x) * pk.t;
+      var y = s.y + (t.y - s.y) * pk.t;
+      var depth = s.s + (t.s - s.s) * pk.t;
+      var col = pk.sos ? '255,68,56' : '61,220,151';
+
+      // trail
+      var tail = clamp(pk.t - 0.16, 0, 1);
+      var tx = s.x + (t.x - s.x) * tail, ty = s.y + (t.y - s.y) * tail;
+      var grad = ctx.createLinearGradient(tx, ty, x, y);
+      grad.addColorStop(0, 'rgba(' + col + ',0)');
+      grad.addColorStop(1, 'rgba(' + col + ',' + (0.55 * depth).toFixed(3) + ')');
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = 1.6 * depth;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(x, y); ctx.stroke();
+
+      ctx.fillStyle = 'rgba(' + col + ',' + (0.16 * depth).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 9 * depth, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(' + col + ',' + (0.95 * depth).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 2.4 * depth, 0, 6.2832); ctx.fill();
+    }
+  }
+
+  var lastSpawn = 0;
+  function latticeLoop(time){
+    if (heroVisible){
+      if (!RM && time - lastSpawn > 260 && packets.length < 14){ spawnPacket(); lastSpawn = time; }
+      drawLattice(time);
+    }
+    requestAnimationFrame(latticeLoop);
+  }
+
+  buildLattice();
+  if (RM){ spawnPacket(); drawLattice(0); }
+  else { requestAnimationFrame(latticeLoop); }
+
+  if (heroEl && 'IntersectionObserver' in window){
+    new IntersectionObserver(function(en){ heroVisible = en[0].isIntersecting; }, { threshold: 0 })
+      .observe(heroEl);
+  }
+
+  window.addEventListener('pointermove', function(e){
+    if (RM) return;
+    pointerX = (e.clientX / window.innerWidth) * 2 - 1;
+    pointerY = (e.clientY / window.innerHeight) * 2 - 1;
+  }, { passive: true });
+
+  /* ---------- thesis: light the words as the section scrolls ---------- */
+  var words = [];
+  (function wrapWords(){
+    var el = document.getElementById('thesis-text');
+    if (!el) return;
+    var nodesIn = Array.prototype.slice.call(el.childNodes);
+    el.textContent = '';
+    nodesIn.forEach(function(n){
+      var em = n.nodeType === 1 && n.tagName === 'EM';
+      (n.textContent || '').split(/\s+/).filter(Boolean).forEach(function(w){
+        var s = document.createElement('span');
+        s.className = 'w' + (em ? (/towers/.test(w) ? ' red' : ' cyan') : '');
+        s.textContent = w;
+        el.appendChild(s);
+        el.appendChild(document.createTextNode(' '));
+        words.push(s);
+      });
+    });
+    if (RM) words.forEach(function(w){ w.classList.add('on'); });
+  })();
+
+  function driveThesis(){
+    if (!words.length || RM) return;
+    var sec = document.getElementById('thesis');
+    var r = sec.getBoundingClientRect();
+    var total = r.height - window.innerHeight;
+    var p = clamp(-r.top / total, 0, 1);
+    var lit = Math.floor(seg(p, 0.05, 0.8) * words.length);
+    for (var i = 0; i < words.length; i++) words[i].classList.toggle('on', i < lit);
+  }
+
+  /* ---------- relay: scrub a packet along the 3D rail ---------- */
+  var rail = document.getElementById('rail');
+  var packetEl = document.getElementById('packet');
+  var hops = rail ? rail.querySelectorAll('.hop') : [];
+  var steps = document.querySelectorAll('#relay-steps .step');
+  var hopPos = [];
+  if (hops.length){
+    for (var h = 0; h < hops.length; h++){
+      var st = hops[h].getAttribute('style');
+      hopPos.push({
+        x: parseFloat(/--x:(-?[\d.]+)/.exec(st)[1]),
+        y: parseFloat(/--y:(-?[\d.]+)/.exec(st)[1]),
+        z: parseFloat(/--z:(-?[\d.]+)/.exec(st)[1])
+      });
+    }
+  }
+
+  function driveRelay(){
+    var sec = document.getElementById('relay');
+    if (!sec || !rail) return;
+    var r = sec.getBoundingClientRect();
+    var total = r.height - window.innerHeight;
+    var p = clamp(-r.top / total, 0, 1);
+    rail.style.setProperty('--p', p.toFixed(4));
+
+    // the packet's position along the chain of hops
+    var legs = hopPos.length - 1;
+    var travel = seg(p, 0.1, 0.92) * legs;
+    var leg = clamp(Math.floor(travel), 0, legs - 1);
+    var f = travel - leg;
+    var A = hopPos[leg], B = hopPos[leg + 1];
+    if (packetEl && A && B){
+      packetEl.style.setProperty('--px', (A.x + (B.x - A.x) * f).toFixed(1) + 'px');
+      packetEl.style.setProperty('--py', (A.y + (B.y - A.y) * f).toFixed(1) + 'px');
+      packetEl.style.setProperty('--pz', (A.z + (B.z - A.z) * f).toFixed(1) + 'px');
+      packetEl.style.opacity = p > 0.06 ? 1 : 0;
+    }
+    for (var i = 0; i < hops.length; i++){
+      if (i === 0) continue;
+      hops[i].classList.toggle('lit', travel >= i - 0.12);
+    }
+    for (var s = 0; s < steps.length; s++){
+      steps[s].classList.toggle('on', travel >= s - 0.2);
+    }
+  }
+
+  /* ---------- app: rotate the phone and change the screen ---------- */
+  var rig = document.getElementById('rig');
+  var screens = document.querySelectorAll('.scr');
+  var slides = document.querySelectorAll('.app-slide');
+
+  function driveApp(){
+    var sec = document.getElementById('app');
+    if (!sec || !rig) return;
+    var r = sec.getBoundingClientRect();
+    var total = r.height - window.innerHeight;
+    var p = clamp(-r.top / total, 0, 1);
+    rig.style.setProperty('--p', p.toFixed(4));
+
+    var idx = clamp(Math.floor(seg(p, 0.02, 0.98) * 4), 0, 3);
+    for (var i = 0; i < screens.length; i++) screens[i].classList.toggle('on', i === idx);
+    for (var j = 0; j < slides.length; j++) slides[j].classList.toggle('on', j === idx);
+  }
+
+  /* ---------- packet anatomy: explode the stack ---------- */
+  var slabs = document.getElementById('slabs');
+  var anatItems = document.querySelectorAll('#anat-list li');
+
+  function driveAnat(){
+    var sec = document.getElementById('anatomy');
+    if (!sec || !slabs) return;
+    var r = sec.getBoundingClientRect();
+    var total = r.height - window.innerHeight;
+    var p = clamp(-r.top / total, 0, 1);
+    slabs.style.setProperty('--p', seg(p, 0.06, 0.72).toFixed(4));
+
+    var active = clamp(Math.floor(seg(p, 0.1, 0.95) * 4), 0, 3);
+    for (var i = 0; i < anatItems.length; i++){
+      // the list reads top-down; the stack explodes signature-first
+      anatItems[i].classList.toggle('on', i === active);
+    }
+  }
+
+  /* ---------- scroll orchestration ---------- */
+  var nav = document.getElementById('nav');
+  var bar = document.getElementById('progress');
+  var queued = false;
+
+  function update(){
+    queued = false;
+    var y = window.scrollY;
+    if (nav) nav.classList.toggle('on', y > 24);
+    var max = doc.scrollHeight - window.innerHeight;
+    if (bar) bar.style.transform = 'scaleX(' + (max > 0 ? y / max : 0) + ')';
+    scrollTurn = y * 0.00035;
+    driveThesis();
+    driveRelay();
+    driveApp();
+    driveAnat();
+  }
+  function onScroll(){ if (!queued){ queued = true; requestAnimationFrame(update); } }
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', function(){ buildLattice(); update(); }, { passive: true });
+  update();
+
+  /* ---------- reveal ---------- */
+  var rvs = document.querySelectorAll('.rv');
+  if (RM || !('IntersectionObserver' in window)){
+    for (var i = 0; i < rvs.length; i++) rvs[i].classList.add('in');
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if (en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); }
+      });
+    }, { threshold: 0.16, rootMargin: '0px 0px -6% 0px' });
+    for (var r2 = 0; r2 < rvs.length; r2++) io.observe(rvs[r2]);
+  }
+
+  /* ---------- counters ---------- */
+  var counters = document.querySelectorAll('[data-count]');
+  function run(el){
+    var to = parseInt(el.getAttribute('data-to'), 10);
+    if (RM){ el.textContent = to.toLocaleString('en-IN'); return; }
+    var t0 = null;
+    function step(t){
+      if (t0 === null) t0 = t;
+      var p = clamp((t - t0) / 1500, 0, 1);
+      var e = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(to * e).toLocaleString('en-IN');
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  if (RM || !('IntersectionObserver' in window)){
+    for (var c = 0; c < counters.length; c++) counters[c].textContent = counters[c].getAttribute('data-to');
+  } else {
+    var io2 = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if (en.isIntersecting){ run(en.target); io2.unobserve(en.target); }
+      });
+    }, { threshold: 0.5 });
+    for (var c2 = 0; c2 < counters.length; c2++) io2.observe(counters[c2]);
+  }
+})();
+</script>
+
+</body>
+</html>

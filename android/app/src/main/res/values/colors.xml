@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Mirrors ui/theme/Theme.kt so the launch window matches the Compose UI. -->
-    <color name="obsidian_background">#FF0B0E14</color>
-    <color name="signal_red">#FFFF3B30</color>
-    <color name="ic_launcher_background">#FF0B0E14</color>
+    <color name="obsidian_background">#FF070A11</color>
+    <color name="signal_red">#FFFF4438</color>
+    <color name="ic_launcher_background">#FF070A11</color>
 </resources>
