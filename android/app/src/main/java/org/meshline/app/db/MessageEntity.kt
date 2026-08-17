@@ -27,9 +27,26 @@ data class MessageEntity(
     val packetType: String,
     val status: MessageStatus,
     /** True when the text was recovered from an authenticated encrypted session. */
-    val encrypted: Boolean = false
+    val encrypted: Boolean = false,
+    /**
+     * Set when this message belongs to a private group. Group messages are
+     * addressed to a derived tag rather than to a node, so [recipientId] cannot
+     * identify the conversation on its own.
+     */
+    val groupId: String? = null
 ) {
     val isOutgoing: Boolean get() = senderId == LOCAL_SENDER
+
+    /** The conversation this message belongs in: a group, a peer, or the broadcast feed. */
+    val conversationId: String
+        get() = when {
+            groupId != null -> groupId
+            // Broadcast traffic is one shared feed regardless of direction, so
+            // an incoming SOS must not open a conversation with its sender.
+            recipientId == BROADCAST_RECIPIENT -> BROADCAST_RECIPIENT
+            isOutgoing -> recipientId
+            else -> senderId
+        }
 
     companion object {
         const val LOCAL_SENDER = "me"

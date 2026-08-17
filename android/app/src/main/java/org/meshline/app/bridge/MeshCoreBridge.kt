@@ -139,6 +139,79 @@ object MeshCoreBridge {
     fun hasSession(peerIdHex: String): Boolean =
         guarded { nativeHasSession(peerIdHex) } ?: false
 
+    // -----------------------------------------------------------------------
+    // Out-of-band verification
+    // -----------------------------------------------------------------------
+
+    /**
+     * The safety number to compare with a peer in person, as twelve
+     * space-separated groups of five digits. Null when there is no session, in
+     * which case there is no authenticated key to derive it from and the UI must
+     * not show anything that looks like one.
+     */
+    fun safetyNumber(peerIdHex: String): String? =
+        guarded { nativeSafetyNumber(peerIdHex) }
+
+    /** Records the user's decision after they compared safety numbers. */
+    fun setPeerVerified(peerIdHex: String, verified: Boolean): Boolean =
+        guarded { nativeSetPeerVerified(peerIdHex, verified) } ?: false
+
+    fun isPeerVerified(peerIdHex: String): Boolean =
+        guarded { nativeIsPeerVerified(peerIdHex) } ?: false
+
+    // -----------------------------------------------------------------------
+    // Groups
+    // -----------------------------------------------------------------------
+
+    /** Creates a group with this device as admin. Returns its id, or null on failure. */
+    fun createGroup(name: String): String? = guarded { nativeCreateGroup(name) }
+
+    /**
+     * Adds a peer to a group, returning the invite packet to send. Null means
+     * the invite was not created — most often because there is no pairwise
+     * session with that peer yet, which is a precondition rather than a bug.
+     */
+    fun inviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray? =
+        guarded { nativeInviteToGroup(groupIdHex, peerIdHex) }
+
+    /**
+     * Builds an encrypted group message, or null when this device holds no key
+     * for the group. Null must be treated as "not sent".
+     */
+    fun createGroupChat(groupIdHex: String, message: String): ByteArray? =
+        guarded { nativeCreateGroupChat(groupIdHex, message) }
+
+    /**
+     * Removes a member and rotates the group key, returning JSON describing the
+     * invites to send and any members that could not be reached.
+     */
+    fun removeFromGroup(groupIdHex: String, peerIdHex: String): String? =
+        guarded { nativeRemoveFromGroup(groupIdHex, peerIdHex) }
+
+    /** Rotates a group key without changing membership. */
+    fun rekeyGroup(groupIdHex: String): String? = guarded { nativeRekeyGroup(groupIdHex) }
+
+    fun leaveGroup(groupIdHex: String): Boolean =
+        guarded { nativeLeaveGroup(groupIdHex) } ?: false
+
+    fun groupsJson(): String? = guarded { nativeGroupsJson() }
+
+    // -----------------------------------------------------------------------
+    // Secure state at rest
+    // -----------------------------------------------------------------------
+
+    /** Seals sessions, group keys, and verifications under a caller-held key. */
+    fun exportState(vaultKey: ByteArray): ByteArray? = guarded { nativeExportState(vaultKey) }
+
+    /** Restores state sealed by [exportState]. False means it could not be opened. */
+    fun importState(vaultKey: ByteArray, blob: ByteArray): Boolean =
+        guarded { nativeImportState(vaultKey, blob) } ?: false
+
+    /** Forgets every session, group key, and verification held by the core. */
+    fun wipeSecureState() {
+        guarded { nativeWipeSecureState() }
+    }
+
     /**
      * Verifies and processes an inbound frame, returning a JSON description of
      * what to do next. A null return means the packet failed authentication and
@@ -190,4 +263,17 @@ object MeshCoreBridge {
     private external fun nativeProcessIncoming(rawPacket: ByteArray): String?
     private external fun nativeActivePinsJson(): String?
     private external fun nativeUpdateBattery(batteryLevel: Int, isCharging: Boolean)
+    private external fun nativeSafetyNumber(peerIdHex: String): String?
+    private external fun nativeSetPeerVerified(peerIdHex: String, verified: Boolean): Boolean
+    private external fun nativeIsPeerVerified(peerIdHex: String): Boolean
+    private external fun nativeCreateGroup(name: String): String?
+    private external fun nativeInviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray?
+    private external fun nativeCreateGroupChat(groupIdHex: String, message: String): ByteArray?
+    private external fun nativeRemoveFromGroup(groupIdHex: String, peerIdHex: String): String?
+    private external fun nativeRekeyGroup(groupIdHex: String): String?
+    private external fun nativeLeaveGroup(groupIdHex: String): Boolean
+    private external fun nativeGroupsJson(): String?
+    private external fun nativeExportState(vaultKey: ByteArray): ByteArray?
+    private external fun nativeImportState(vaultKey: ByteArray, blob: ByteArray): Boolean
+    private external fun nativeWipeSecureState()
 }

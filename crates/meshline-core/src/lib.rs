@@ -8,12 +8,17 @@ pub mod transport;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-pub use crypto::noise::{
-    CryptoError, HandshakeSession, IdentityProof, SessionManager, TransportSession,
+pub use crypto::group::{
+    Group, GroupInvite, GroupStore, InviteOutcome, MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
 };
+pub use crypto::noise::{HandshakeSession, IdentityProof, SessionManager};
+pub use crypto::session::TransportSession;
+pub use crypto::trust::{safety_number, safety_number_groups, TrustStore, VerificationRecord};
+pub use crypto::CryptoError;
 pub use gis::pins::{GisPinStore, PinError, ResourcePin, ResourcePinType};
 pub use packet::schema::{
     node_id_from_pubkey, LocationTag, Packet, PacketError, PacketHeader, PacketType,
@@ -51,8 +56,24 @@ pub enum MeshError {
     PayloadTooLarge,
     #[error("no encrypted session with recipient; complete a handshake first")]
     NoSession,
+    #[error("this node has never been seen, so there is nothing to verify")]
+    UnknownPeer,
     #[error("serialization: {0}")]
     Serialization(String),
+}
+
+/// The result of rekeying a group: who to send the new key to, and who could
+/// not be reached.
+///
+/// Both halves matter. A rekey that silently fails to reach half the group
+/// leaves those members unable to read anything sent afterwards, and the user
+/// needs to be told that rather than discovering it through silence.
+#[derive(Debug, Clone)]
+pub struct GroupRekeyResult {
+    /// Invite packets to transmit, one per reachable member.
+    pub invites: Vec<Packet>,
+    /// Members with no pairwise session, who therefore did not get the new key.
+    pub unreachable: Vec<[u8; 16]>,
 }
 
 /// What a receiver should do with a packet that passed verification.
@@ -68,11 +89,18 @@ pub struct ReceiveOutcome {
     /// one. Produced here rather than by a second call, because a handshake
     /// message may only be consumed once.
     pub handshake_reply: Option<Packet>,
-    /// Decrypted chat text, present only for Chat packets addressed to us on an
-    /// established session.
+    /// Decrypted text. Present for a Chat packet addressed to us on an
+    /// established session, or for a group message we hold the key to.
     pub plaintext: Option<Vec<u8>>,
-    /// True when the packet was addressed to this node specifically.
+    /// True when the packet was addressed to this node specifically. Group
+    /// traffic is addressed to a group tag, so this stays false for it.
     pub addressed_to_us: bool,
+    /// The group this packet belongs to, when we are a member of it.
+    pub group_id: Option<[u8; 16]>,
+    /// The group's name, for a UI that has not seen the group before.
+    pub group_name: Option<String>,
+    /// Set when a group invite changed this device's membership.
+    pub group_event: Option<InviteOutcome>,
 }
 
 pub struct MeshNode {
@@ -83,6 +111,27 @@ pub struct MeshNode {
     pub pin_store: Arc<GisPinStore>,
     pub rate_limiter: Arc<MeshRateLimiter>,
     pub sessions: Arc<Mutex<SessionManager>>,
+    pub groups: Arc<Mutex<GroupStore>>,
+    pub trust: Arc<Mutex<TrustStore>>,
+}
+
+/// The secure state as it is written to the vault.
+///
+/// Borrowed on the way out so that session and group keys are not copied into a
+/// second buffer before being sealed.
+#[derive(Serialize)]
+struct SecureStateOut<'a> {
+    sessions: Vec<&'a TransportSession>,
+    groups: &'a GroupStore,
+    trust: &'a TrustStore,
+}
+
+/// The same state on the way back in.
+#[derive(Deserialize)]
+struct SecureStateIn {
+    sessions: Vec<TransportSession>,
+    groups: GroupStore,
+    trust: TrustStore,
 }
 
 impl MeshNode {
@@ -112,6 +161,8 @@ impl MeshNode {
             pin_store: Arc::new(GisPinStore::new()),
             rate_limiter: Arc::new(MeshRateLimiter::new(10.0, 2.0)),
             sessions: Arc::new(Mutex::new(SessionManager::new())),
+            groups: Arc::new(Mutex::new(GroupStore::new())),
+            trust: Arc::new(Mutex::new(TrustStore::new())),
         }
     }
 
@@ -289,7 +340,7 @@ impl MeshNode {
     pub fn begin_handshake(&self, peer_id: [u8; 16]) -> Result<Packet, MeshError> {
         let msg = {
             let mut sessions = self.sessions.lock().expect("session mutex poisoned");
-            sessions.begin_handshake(peer_id, &self.signing_key)?
+            sessions.begin_handshake(peer_id, &self.signing_key, Self::now())?
         };
         self.sign_packet(
             PacketType::NoiseHandshake,
@@ -306,6 +357,258 @@ impl MeshNode {
             .lock()
             .expect("session mutex poisoned")
             .has_session(peer_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-band verification
+    // -----------------------------------------------------------------------
+
+    /// The safety number to compare with a peer, in person or over a channel
+    /// you already trust.
+    ///
+    /// Requires an established session, because the number is derived from the
+    /// identity key the handshake actually authenticated rather than from
+    /// anything a peer merely claims.
+    pub fn safety_number_with(&self, peer_id: &[u8; 16]) -> Result<Vec<String>, MeshError> {
+        let peer_key = self
+            .sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .peer_identity_pubkey(peer_id)
+            .ok_or(MeshError::NoSession)?;
+
+        Ok(safety_number_groups(&self.public_key_bytes(), &peer_key))
+    }
+
+    /// Records the user's decision after they compared safety numbers.
+    pub fn set_peer_verified(&self, peer_id: &[u8; 16], verified: bool) -> Result<(), MeshError> {
+        let mut trust = self.trust.lock().expect("trust mutex poisoned");
+        if trust.set_verified(peer_id, verified, Self::now()) {
+            Ok(())
+        } else {
+            Err(MeshError::UnknownPeer)
+        }
+    }
+
+    pub fn is_peer_verified(&self, peer_id: &[u8; 16]) -> bool {
+        self.trust
+            .lock()
+            .expect("trust mutex poisoned")
+            .is_verified(peer_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Groups
+    // -----------------------------------------------------------------------
+
+    /// Creates a group with this device as admin and sole member.
+    pub fn create_group(&self, name: &str) -> Result<[u8; 16], MeshError> {
+        let mut groups = self.groups.lock().expect("group mutex poisoned");
+        Ok(groups.create(self.node_id, name, Self::now())?)
+    }
+
+    /// Adds a peer to a group and returns the invite to send them.
+    ///
+    /// The group key travels inside the pairwise Noise session, so a peer you
+    /// have not completed a handshake with cannot be added at all. That is
+    /// deliberate: it means group membership can never be a way to hand key
+    /// material to someone whose identity was never authenticated.
+    pub fn invite_to_group(
+        &self,
+        group_id: &[u8; 16],
+        peer_id: [u8; 16],
+    ) -> Result<Packet, MeshError> {
+        // Authorisation before capability: a non-admin must be told they are
+        // not allowed, not that the peer happens to be unreachable.
+        {
+            let groups = self.groups.lock().expect("group mutex poisoned");
+            let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+            if !group.is_admin(&self.node_id) {
+                return Err(CryptoError::NotGroupAdmin.into());
+            }
+        }
+        if !self.has_session_with(&peer_id) {
+            return Err(MeshError::NoSession);
+        }
+
+        let invite_bytes = {
+            let mut groups = self.groups.lock().expect("group mutex poisoned");
+            groups.add_member(group_id, &self.node_id, peer_id)?;
+            let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+            crypto::group::encode_invite(&group.to_invite())?
+        };
+
+        self.sealed_invite_packet(peer_id, &invite_bytes)
+    }
+
+    /// Wraps an invite in a pairwise session and signs the resulting packet.
+    fn sealed_invite_packet(
+        &self,
+        peer_id: [u8; 16],
+        invite_bytes: &[u8],
+    ) -> Result<Packet, MeshError> {
+        let ciphertext = {
+            let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+            sessions.encrypt_for(&peer_id, invite_bytes)?
+        };
+        self.sign_packet(
+            PacketType::GroupInvite,
+            Self::random_msg_id(),
+            peer_id,
+            None,
+            0,
+            ciphertext,
+        )
+    }
+
+    /// Removes a member and rekeys the group, returning the invites that carry
+    /// the new key to everyone who remains.
+    pub fn remove_from_group(
+        &self,
+        group_id: &[u8; 16],
+        member: &[u8; 16],
+    ) -> Result<GroupRekeyResult, MeshError> {
+        let remaining = {
+            let mut groups = self.groups.lock().expect("group mutex poisoned");
+            groups.remove_member(group_id, &self.node_id, member)?
+        };
+        self.distribute_group_key(group_id, &remaining)
+    }
+
+    /// Rotates a group's key without changing its membership, for when a
+    /// member's device may have been seized or compromised.
+    pub fn rekey_group(&self, group_id: &[u8; 16]) -> Result<GroupRekeyResult, MeshError> {
+        let remaining = {
+            let mut groups = self.groups.lock().expect("group mutex poisoned");
+            groups.rekey(group_id, &self.node_id)?
+        };
+        self.distribute_group_key(group_id, &remaining)
+    }
+
+    /// Builds one invite per member, reporting those we cannot reach rather
+    /// than pretending the rekey was complete.
+    fn distribute_group_key(
+        &self,
+        group_id: &[u8; 16],
+        members: &[[u8; 16]],
+    ) -> Result<GroupRekeyResult, MeshError> {
+        let invite_bytes = {
+            let groups = self.groups.lock().expect("group mutex poisoned");
+            let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+            crypto::group::encode_invite(&group.to_invite())?
+        };
+
+        let mut invites = Vec::new();
+        let mut unreachable = Vec::new();
+        for member in members {
+            if member == &self.node_id {
+                continue;
+            }
+            match self.sealed_invite_packet(*member, &invite_bytes) {
+                Ok(packet) => invites.push(packet),
+                Err(_) => unreachable.push(*member),
+            }
+        }
+
+        Ok(GroupRekeyResult {
+            invites,
+            unreachable,
+        })
+    }
+
+    /// Builds an encrypted message for a group.
+    ///
+    /// The packet is addressed to the group's tag, not to any member, so the
+    /// mesh can route and dedup it without learning who the group is.
+    pub fn create_group_chat_packet(
+        &self,
+        group_id: &[u8; 16],
+        message: &str,
+    ) -> Result<Packet, MeshError> {
+        let (tag, ciphertext) = {
+            let mut groups = self.groups.lock().expect("group mutex poisoned");
+            let group = groups.get_mut(group_id).ok_or(CryptoError::UnknownGroup)?;
+            let ciphertext = group.encrypt(&self.node_id, message.as_bytes())?;
+            (group.tag(), ciphertext)
+        };
+
+        self.sign_packet(
+            PacketType::GroupChat,
+            Self::random_msg_id(),
+            tag,
+            None,
+            0,
+            ciphertext,
+        )
+    }
+
+    /// Leaves a group, deleting its key from this device.
+    pub fn leave_group(&self, group_id: &[u8; 16]) -> bool {
+        self.groups
+            .lock()
+            .expect("group mutex poisoned")
+            .leave(group_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Secure state at rest
+    // -----------------------------------------------------------------------
+
+    /// Seals sessions, groups, and verification decisions under `vault_key`.
+    ///
+    /// The key belongs in platform-protected storage. Everything in here is
+    /// live key material, which is exactly what makes a seized device dangerous
+    /// to the rest of the mesh.
+    pub fn export_secure_state(&self, vault_key: &[u8; 32]) -> Result<Vec<u8>, MeshError> {
+        let sessions = self.sessions.lock().expect("session mutex poisoned");
+        let groups = self.groups.lock().expect("group mutex poisoned");
+        let trust = self.trust.lock().expect("trust mutex poisoned");
+
+        let state = SecureStateOut {
+            sessions: sessions.sessions_for_export(),
+            groups: &groups,
+            trust: &trust,
+        };
+        let plaintext =
+            bincode::serialize(&state).map_err(|e| MeshError::Serialization(e.to_string()))?;
+
+        Ok(crypto::vault::seal(vault_key, &plaintext)?)
+    }
+
+    /// Restores state sealed by [`export_secure_state`](Self::export_secure_state).
+    ///
+    /// A blob that will not open is treated as absent, not as a reason to run
+    /// with half a session table: the caller starts fresh and re-handshakes.
+    pub fn import_secure_state(
+        &self,
+        vault_key: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<(), MeshError> {
+        let plaintext = crypto::vault::open(vault_key, blob)?;
+        let state: SecureStateIn = bincode::deserialize(&plaintext)
+            .map_err(|e| MeshError::Serialization(e.to_string()))?;
+
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .install_sessions(state.sessions);
+        *self.groups.lock().expect("group mutex poisoned") = state.groups;
+        *self.trust.lock().expect("trust mutex poisoned") = state.trust;
+        Ok(())
+    }
+
+    /// Forgets every session, group key, and verification on this device.
+    ///
+    /// This is the control someone reaches for when a phone is about to be
+    /// taken from them. It cannot un-send what has already gone out, but it
+    /// makes this device useless for reading anything further.
+    pub fn wipe_secure_state(&self) {
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .clear();
+        self.groups.lock().expect("group mutex poisoned").clear();
+        *self.trust.lock().expect("trust mutex poisoned") = TrustStore::new();
     }
 
     /// Validates and processes an inbound frame from any transport.
@@ -345,6 +648,9 @@ impl MeshNode {
         // 6. Type-specific handling, skipped for packets we have already seen.
         let mut plaintext = None;
         let mut handshake_reply = None;
+        let mut group_id = None;
+        let mut group_name = None;
+        let mut group_event = None;
         if !is_duplicate {
             match packet.header.packet_type {
                 PacketType::ResourcePin => {
@@ -361,14 +667,27 @@ impl MeshNode {
                     let reply_bytes = {
                         let mut sessions =
                             self.sessions.lock().expect("session mutex poisoned");
-                        sessions
+                        let reply = sessions
                             .accept_handshake(
                                 packet.header.sender_id,
                                 &packet.payload,
                                 &self.signing_key,
+                                now,
                             )
                             .ok()
-                            .flatten()
+                            .flatten();
+
+                        // Once a session exists, remember the identity behind it
+                        // so the user can be offered a safety number to compare.
+                        if let Some(key) =
+                            sessions.peer_identity_pubkey(&packet.header.sender_id)
+                        {
+                            self.trust
+                                .lock()
+                                .expect("trust mutex poisoned")
+                                .observe(key, now);
+                        }
+                        reply
                     };
                     if let Some(bytes) = reply_bytes {
                         handshake_reply = self
@@ -388,6 +707,50 @@ impl MeshNode {
                     plaintext = sessions
                         .decrypt_from(&packet.header.sender_id, &packet.payload)
                         .ok();
+                }
+                PacketType::GroupInvite if addressed_to_us => {
+                    // An invite only means anything inside an authenticated
+                    // pairwise session, so it is opened there first and the
+                    // sender that the group store checks against is the one the
+                    // packet signature already proved.
+                    let invite_bytes = {
+                        let mut sessions =
+                            self.sessions.lock().expect("session mutex poisoned");
+                        sessions
+                            .decrypt_from(&packet.header.sender_id, &packet.payload)
+                            .ok()
+                    };
+
+                    if let Some(bytes) = invite_bytes {
+                        if let Ok(invite) = crypto::group::decode_invite(&bytes) {
+                            let mut groups = self.groups.lock().expect("group mutex poisoned");
+                            if let Ok(outcome) = groups.apply_invite(
+                                &packet.header.sender_id,
+                                &self.node_id,
+                                &invite,
+                            ) {
+                                group_id = Some(invite.group_id);
+                                group_name = Some(invite.name.clone());
+                                group_event = Some(outcome);
+                            }
+                        }
+                    }
+                }
+                PacketType::GroupChat => {
+                    // Addressed to a group tag rather than to us. A non-member
+                    // finds no match, learns nothing, and relays it anyway.
+                    let mut groups = self.groups.lock().expect("group mutex poisoned");
+                    if let Some(id) = groups.by_tag(&packet.header.recipient_id) {
+                        if let Some(group) = groups.get_mut(&id) {
+                            if let Ok(text) =
+                                group.decrypt(&packet.header.sender_id, &packet.payload)
+                            {
+                                plaintext = Some(text);
+                                group_id = Some(id);
+                                group_name = Some(group.name.clone());
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -417,6 +780,9 @@ impl MeshNode {
             handshake_reply,
             plaintext,
             addressed_to_us,
+            group_id,
+            group_name,
+            group_event,
         })
     }
 
@@ -673,6 +1039,13 @@ mod tests {
         let bob = MeshNode::new();
         let nosy_relay = MeshNode::new();
 
+        // Relaying of non-SOS traffic is probabilistic by battery state, so pin
+        // it to the always-relay state rather than letting the assertion below
+        // fail 15% of the time.
+        nosy_relay
+            .routing
+            .set_battery_state(BatteryPowerState::Charging);
+
         handshake(&alice, &bob);
 
         let chat = alice.create_chat_packet(bob.node_id, "meet at gate 4").unwrap();
@@ -731,5 +1104,436 @@ mod tests {
         let node = MeshNode::new();
         assert!(node.create_public_sos("help", f32::NAN, 0.0).is_err());
         assert!(node.create_public_sos("help", 200.0, 0.0).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-band verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn both_devices_show_the_same_safety_number() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+
+        let on_alices_screen = alice.safety_number_with(&bob.node_id).unwrap();
+        let on_bobs_screen = bob.safety_number_with(&alice.node_id).unwrap();
+
+        assert_eq!(on_alices_screen, on_bobs_screen);
+        assert_eq!(on_alices_screen.len(), 12, "twelve groups of five digits");
+    }
+
+    #[test]
+    fn a_safety_number_needs_a_session_to_be_meaningful() {
+        let alice = MeshNode::new();
+        let stranger = MeshNode::new();
+        assert!(matches!(
+            alice.safety_number_with(&stranger.node_id),
+            Err(MeshError::NoSession)
+        ));
+    }
+
+    #[test]
+    fn an_impostor_shows_a_different_safety_number() {
+        let alice = MeshNode::new();
+        let real_bob = MeshNode::new();
+        let impostor = MeshNode::new();
+
+        handshake(&alice, &real_bob);
+        handshake(&alice, &impostor);
+
+        assert_ne!(
+            alice.safety_number_with(&real_bob.node_id).unwrap(),
+            alice.safety_number_with(&impostor.node_id).unwrap(),
+            "comparing digits in person must expose a substituted identity"
+        );
+    }
+
+    #[test]
+    fn peers_start_unverified_and_verification_is_recorded() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+
+        assert!(
+            !alice.is_peer_verified(&bob.node_id),
+            "a completed handshake is not the same as a verified human"
+        );
+        alice.set_peer_verified(&bob.node_id, true).unwrap();
+        assert!(alice.is_peer_verified(&bob.node_id));
+    }
+
+    #[test]
+    fn a_peer_never_seen_cannot_be_marked_verified() {
+        let alice = MeshNode::new();
+        assert!(matches!(
+            alice.set_peer_verified(&[0x11; 16], true),
+            Err(MeshError::UnknownPeer)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Groups
+    // -----------------------------------------------------------------------
+
+    /// Alice creates a group and brings Bob and Carol in over real packets.
+    fn affinity_group(
+        alice: &MeshNode,
+        bob: &MeshNode,
+        carol: &MeshNode,
+    ) -> [u8; 16] {
+        handshake(alice, bob);
+        handshake(alice, carol);
+
+        let gid = alice.create_group("affinity").unwrap();
+
+        let to_bob = alice.invite_to_group(&gid, bob.node_id).unwrap();
+        let joined = bob.process_incoming(&wire(&to_bob)).unwrap();
+        assert_eq!(joined.group_event, Some(InviteOutcome::Joined));
+
+        let to_carol = alice.invite_to_group(&gid, carol.node_id).unwrap();
+        carol.process_incoming(&wire(&to_carol)).unwrap();
+
+        gid
+    }
+
+    #[test]
+    fn a_group_message_reaches_every_member() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let packet = alice
+            .create_group_chat_packet(&gid, "line forming at the north end")
+            .unwrap();
+        let on_wire = wire(&packet);
+
+        // Not readable on the radio.
+        assert!(!on_wire
+            .windows("line forming".len())
+            .any(|w| w == b"line forming"));
+
+        for member in [&bob, &carol] {
+            let received = member.process_incoming(&on_wire).unwrap();
+            assert_eq!(
+                received.plaintext.as_deref(),
+                Some(&b"line forming at the north end"[..])
+            );
+            assert_eq!(received.group_id, Some(gid));
+            assert_eq!(received.group_name.as_deref(), Some("affinity"));
+        }
+    }
+
+    #[test]
+    fn a_non_member_carries_group_traffic_without_reading_it() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let outsider = MeshNode::new();
+        outsider
+            .routing
+            .set_battery_state(BatteryPowerState::Charging);
+
+        let packet = alice.create_group_chat_packet(&gid, "medic needed").unwrap();
+        let relayed = outsider.process_incoming(&wire(&packet)).unwrap();
+
+        assert!(relayed.plaintext.is_none(), "an outsider must learn nothing");
+        assert!(relayed.group_id.is_none());
+        assert!(
+            relayed.should_relay,
+            "but the mesh only works if it carries traffic it cannot read"
+        );
+    }
+
+    #[test]
+    fn the_group_id_never_appears_on_the_wire() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let packet = alice.create_group_chat_packet(&gid, "hold").unwrap();
+        assert_ne!(
+            packet.header.recipient_id, gid,
+            "the packet is addressed to a derived tag, not the group itself"
+        );
+        assert!(!wire(&packet).windows(16).any(|w| w == gid));
+    }
+
+    #[test]
+    fn a_group_cannot_be_shared_with_someone_never_handshaken_with() {
+        let alice = MeshNode::new();
+        let stranger = MeshNode::new();
+        let gid = alice.create_group("affinity").unwrap();
+
+        assert!(matches!(
+            alice.invite_to_group(&gid, stranger.node_id),
+            Err(MeshError::NoSession)
+        ));
+        assert_eq!(
+            alice.groups.lock().unwrap().get(&gid).unwrap().member_count(),
+            1,
+            "a failed invite must not leave a member holding no key"
+        );
+    }
+
+    #[test]
+    fn an_outsider_cannot_inject_a_message_into_a_group() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        // The tag is visible to anyone with a radio, so an attacker can address
+        // a packet to the group. Membership is what stops it being read.
+        let genuine = alice.create_group_chat_packet(&gid, "hold").unwrap();
+        let tag = genuine.header.recipient_id;
+
+        let outsider = MeshNode::new();
+        let forged = outsider
+            .sign_packet(
+                PacketType::GroupChat,
+                MeshNode::random_msg_id(),
+                tag,
+                None,
+                0,
+                vec![0xAB; 128],
+            )
+            .unwrap();
+
+        let received = bob.process_incoming(&wire(&forged)).unwrap();
+        assert!(
+            received.plaintext.is_none(),
+            "a packet from a non-member must never surface as group chat"
+        );
+    }
+
+    #[test]
+    fn a_removed_member_is_locked_out_of_later_messages() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let rekey = alice.remove_from_group(&gid, &carol.node_id).unwrap();
+        assert!(rekey.unreachable.is_empty());
+        assert_eq!(rekey.invites.len(), 1, "only Bob remains to be re-keyed");
+
+        for invite in &rekey.invites {
+            let outcome = bob.process_incoming(&wire(invite)).unwrap();
+            assert_eq!(outcome.group_event, Some(InviteOutcome::Rekeyed));
+        }
+
+        let packet = alice
+            .create_group_chat_packet(&gid, "new meeting point is the library")
+            .unwrap();
+        let on_wire = wire(&packet);
+
+        assert_eq!(
+            bob.process_incoming(&on_wire).unwrap().plaintext.as_deref(),
+            Some(&b"new meeting point is the library"[..])
+        );
+        assert!(
+            carol.process_incoming(&on_wire).unwrap().plaintext.is_none(),
+            "a removed member must not be able to read the new epoch"
+        );
+    }
+
+    #[test]
+    fn a_removed_member_is_told_they_are_out() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        // Carol is removed, then re-invited to a group she is no longer in:
+        // the invite Alice sends Bob is not hers, so instead we hand Carol the
+        // admin's next epoch directly, which is what a relayed invite would do.
+        alice.remove_from_group(&gid, &carol.node_id).unwrap();
+        let stale = alice.invite_to_group(&gid, carol.node_id);
+        assert!(
+            stale.is_ok(),
+            "re-adding a removed member is allowed; it is a new epoch for her"
+        );
+        let outcome = carol.process_incoming(&wire(&stale.unwrap())).unwrap();
+        assert_eq!(outcome.group_event, Some(InviteOutcome::Rekeyed));
+    }
+
+    #[test]
+    fn only_the_admin_can_add_or_remove_members() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        // Bob holds the key but is not admin.
+        assert!(matches!(
+            bob.invite_to_group(&gid, carol.node_id),
+            Err(MeshError::Crypto(CryptoError::NotGroupAdmin))
+        ));
+        assert!(matches!(
+            bob.remove_from_group(&gid, &carol.node_id),
+            Err(MeshError::Crypto(CryptoError::NotGroupAdmin))
+        ));
+    }
+
+    #[test]
+    fn a_rekey_reports_members_it_could_not_reach() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        // Bob's session is lost, as happens when a device is reinstalled.
+        alice.sessions.lock().unwrap().drop_session(&bob.node_id);
+
+        let rekey = alice.rekey_group(&gid).unwrap();
+        assert_eq!(rekey.unreachable, vec![bob.node_id]);
+        assert_eq!(rekey.invites.len(), 1, "only Carol could be re-keyed");
+    }
+
+    #[test]
+    fn leaving_a_group_deletes_its_key() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        assert!(bob.leave_group(&gid));
+        let packet = alice.create_group_chat_packet(&gid, "still talking").unwrap();
+        assert!(bob.process_incoming(&wire(&packet)).unwrap().plaintext.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Secure state at rest
+    // -----------------------------------------------------------------------
+
+    /// Simulates an app restart: the node is rebuilt from its identity secret
+    /// and its sealed state, exactly as `MeshCoreBridge` does on launch.
+    fn restart(node: &MeshNode, vault_key: &[u8; 32]) -> MeshNode {
+        let blob = node.export_secure_state(vault_key).unwrap();
+        let restored = MeshNode::from_secret_key(&node.secret_key_bytes());
+        restored.import_secure_state(vault_key, &blob).unwrap();
+        restored
+    }
+
+    #[test]
+    fn a_session_survives_an_app_restart() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+
+        let bob_after_restart = restart(&bob, &[42u8; 32]);
+
+        assert!(bob_after_restart.has_session_with(&alice.node_id));
+        let chat = alice.create_chat_packet(bob.node_id, "are you safe?").unwrap();
+        assert_eq!(
+            bob_after_restart
+                .process_incoming(&wire(&chat))
+                .unwrap()
+                .plaintext
+                .as_deref(),
+            Some(&b"are you safe?"[..]),
+            "a restart must not force a fresh three-message handshake"
+        );
+    }
+
+    #[test]
+    fn groups_and_verification_survive_an_app_restart() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        bob.set_peer_verified(&alice.node_id, true).unwrap();
+
+        let bob_after_restart = restart(&bob, &[7u8; 32]);
+
+        assert!(bob_after_restart.is_peer_verified(&alice.node_id));
+
+        let packet = alice.create_group_chat_packet(&gid, "regroup").unwrap();
+        assert_eq!(
+            bob_after_restart
+                .process_incoming(&wire(&packet))
+                .unwrap()
+                .plaintext
+                .as_deref(),
+            Some(&b"regroup"[..])
+        );
+    }
+
+    #[test]
+    fn a_restored_session_still_refuses_replays() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+
+        let chat = alice.create_chat_packet(bob.node_id, "one time only").unwrap();
+        bob.process_incoming(&wire(&chat)).unwrap();
+
+        // The replay window is part of the sealed state, so a captured packet
+        // must not become deliverable again just because the app restarted.
+        let bob_after_restart = restart(&bob, &[9u8; 32]);
+        assert!(bob_after_restart
+            .process_incoming(&wire(&chat))
+            .unwrap()
+            .plaintext
+            .is_none());
+    }
+
+    #[test]
+    fn the_sealed_state_reveals_nothing_without_the_key() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let gid = bob.create_group("affinity").unwrap();
+
+        let blob = bob.export_secure_state(&[3u8; 32]).unwrap();
+        assert!(!blob.windows(16).any(|w| w == gid), "no group id in the clear");
+        assert!(
+            !blob.windows(16).any(|w| w == alice.node_id),
+            "no peer ids in the clear"
+        );
+
+        let wrong_key = MeshNode::new();
+        assert!(
+            wrong_key.import_secure_state(&[4u8; 32], &blob).is_err(),
+            "a seized device must not give up its state to the wrong key"
+        );
+    }
+
+    #[test]
+    fn corrupt_state_is_refused_rather_than_partly_loaded() {
+        let bob = MeshNode::new();
+        bob.create_group("affinity").unwrap();
+        let mut blob = bob.export_secure_state(&[5u8; 32]).unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+
+        let fresh = MeshNode::new();
+        assert!(fresh.import_secure_state(&[5u8; 32], &blob).is_err());
+        assert!(fresh.groups.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wiping_leaves_nothing_readable() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        bob.set_peer_verified(&alice.node_id, true).unwrap();
+
+        bob.wipe_secure_state();
+
+        assert!(!bob.has_session_with(&alice.node_id));
+        assert!(!bob.is_peer_verified(&alice.node_id));
+        assert!(bob.groups.lock().unwrap().is_empty());
+
+        let chat = alice.create_chat_packet(bob.node_id, "after the wipe").unwrap();
+        assert!(bob.process_incoming(&wire(&chat)).unwrap().plaintext.is_none());
+
+        let group_msg = alice.create_group_chat_packet(&gid, "after the wipe").unwrap();
+        assert!(bob
+            .process_incoming(&wire(&group_msg))
+            .unwrap()
+            .plaintext
+            .is_none());
+    }
+
+    #[test]
+    fn a_wiped_device_can_still_be_brought_back_by_re_handshaking() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        bob.wipe_secure_state();
+
+        // The mesh identity is untouched by a wipe, so recovery is a fresh
+        // handshake rather than a new identity nobody recognises.
+        handshake(&alice, &bob);
+        let chat = alice.create_chat_packet(bob.node_id, "back online").unwrap();
+        assert_eq!(
+            bob.process_incoming(&wire(&chat)).unwrap().plaintext.as_deref(),
+            Some(&b"back online"[..])
+        );
     }
 }

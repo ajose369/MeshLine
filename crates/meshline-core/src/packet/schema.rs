@@ -52,6 +52,11 @@ pub enum PacketType {
     Ack = 4,
     ResourcePin = 5,
     NoiseHandshake = 6,
+    /// A group key handed to one member, encrypted inside a pairwise session.
+    GroupInvite = 7,
+    /// A message to a group. `recipient_id` carries the group's current tag
+    /// rather than a node id, so it floods to every member without naming them.
+    GroupChat = 8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

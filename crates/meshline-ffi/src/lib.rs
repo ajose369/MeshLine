@@ -17,7 +17,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use meshline_core::{
-    node_id_from_pubkey, BatteryPowerState, MeshNode, PacketType, ResourcePinType,
+    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, MeshNode, PacketType,
+    ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -44,6 +45,14 @@ macro_rules! with_node {
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn bool_out(value: bool) -> jboolean {
+    if value {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
@@ -336,6 +345,388 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeHasSess
 }
 
 // ---------------------------------------------------------------------------
+// Out-of-band verification
+// ---------------------------------------------------------------------------
+
+/// The safety number to compare with a peer, as twelve space-separated groups
+/// of five digits. Null when there is no session, because a safety number
+/// without an authenticated key would be a number about nobody.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeSafetyNumber(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return std::ptr::null_mut(),
+        };
+        let groups = with_node!(std::ptr::null_mut(), |node| node.safety_number_with(&peer));
+
+        match groups {
+            Ok(g) => string_out(&mut env, &g.join(" ")),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Records the user's decision after comparing safety numbers in person.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeSetPeerVerified(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    verified: jboolean,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return JNI_FALSE,
+        };
+        let result = with_node!(JNI_FALSE, |node| node
+            .set_peer_verified(&peer, verified == JNI_TRUE));
+        bool_out(result.is_ok())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeIsPeerVerified(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return JNI_FALSE,
+        };
+        bool_out(with_node!(JNI_FALSE, |node| node.is_peer_verified(&peer)))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct GroupJson {
+    group_id: String,
+    name: String,
+    epoch: u32,
+    admin_id: String,
+    /// True when this device may add or remove members.
+    is_admin: bool,
+    members: Vec<String>,
+    created_at: u64,
+}
+
+/// The packets a membership change produced, plus the members it could not
+/// reach. The caller must surface `unreachable` rather than assuming a rekey
+/// landed everywhere.
+#[derive(Serialize)]
+struct RekeyJson {
+    invite_packets_hex: Vec<String>,
+    unreachable: Vec<String>,
+}
+
+fn rekey_json(result: &GroupRekeyResult) -> RekeyJson {
+    RekeyJson {
+        invite_packets_hex: result
+            .invites
+            .iter()
+            .filter_map(|p| p.to_bytes().ok())
+            .map(|b| to_hex(&b))
+            .collect(),
+        unreachable: result.unreachable.iter().map(|m| to_hex(m)).collect(),
+    }
+}
+
+/// Creates a group with this device as admin. Returns its id as hex.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCreateGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let name = match read_string(&mut env, &name) {
+            Some(n) => n,
+            None => return std::ptr::null_mut(),
+        };
+        let created = with_node!(std::ptr::null_mut(), |node| node.create_group(&name));
+
+        match created {
+            Ok(id) => string_out(&mut env, &to_hex(&id)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Adds a peer to a group, returning the invite packet to transmit. Null when
+/// this device is not the group's admin or has no session with the peer.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeInviteToGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    peer_id_hex: JString,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return std::ptr::null_mut(),
+        };
+
+        let packet = with_node!(std::ptr::null_mut(), |node| node
+            .invite_to_group(&group, peer)
+            .and_then(|p| p.to_bytes().map_err(Into::into)));
+
+        match packet {
+            Ok(bytes) => byte_array_out(&mut env, &bytes),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Builds an encrypted group message. Null when this device holds no key for
+/// the group, which must be treated as "not sent".
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCreateGroupChat(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    message: JString,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let msg = match read_string(&mut env, &message) {
+            Some(m) => m,
+            None => return std::ptr::null_mut(),
+        };
+
+        let packet = with_node!(std::ptr::null_mut(), |node| node
+            .create_group_chat_packet(&group, &msg)
+            .and_then(|p| p.to_bytes().map_err(Into::into)));
+
+        match packet {
+            Ok(bytes) => byte_array_out(&mut env, &bytes),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Removes a member and rotates the group key. Returns the invites carrying the
+/// new key, and the members that could not be reached.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeRemoveFromGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    peer_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return std::ptr::null_mut(),
+        };
+
+        let result = with_node!(std::ptr::null_mut(), |node| node
+            .remove_from_group(&group, &peer));
+
+        match result {
+            Ok(r) => json_out(&mut env, &rekey_json(&r)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Rotates a group key without changing membership, for a suspected compromise.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeRekeyGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let result = with_node!(std::ptr::null_mut(), |node| node.rekey_group(&group));
+
+        match result {
+            Ok(r) => json_out(&mut env, &rekey_json(&r)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeLeaveGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return JNI_FALSE,
+        };
+        bool_out(with_node!(JNI_FALSE, |node| node.leave_group(&group)))
+    })
+}
+
+/// Every group this device belongs to.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeGroupsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let json = with_node!(std::ptr::null_mut(), |node| {
+            let groups = match node.groups.lock() {
+                Ok(g) => g,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            groups
+                .all()
+                .iter()
+                .map(|g| GroupJson {
+                    group_id: to_hex(&g.group_id),
+                    name: g.name.clone(),
+                    epoch: g.epoch,
+                    admin_id: to_hex(&g.admin),
+                    is_admin: g.is_admin(&node.node_id),
+                    members: g.members.iter().map(|m| to_hex(m)).collect(),
+                    created_at: g.created_at,
+                })
+                .collect::<Vec<_>>()
+        });
+
+        json_out(&mut env, &json)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Secure state at rest
+// ---------------------------------------------------------------------------
+
+/// Seals sessions, group keys, and verification decisions under a 32-byte key
+/// the caller keeps in the Android Keystore.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeExportState(
+    mut env: JNIEnv,
+    _class: JClass,
+    vault_key: JByteArray,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), || {
+        let key = match read_vault_key(&mut env, &vault_key) {
+            Some(k) => k,
+            None => return std::ptr::null_mut(),
+        };
+        let blob = with_node!(std::ptr::null_mut(), |node| node.export_secure_state(&key));
+
+        match blob {
+            Ok(bytes) => byte_array_out(&mut env, &bytes),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Restores state sealed by `nativeExportState`. False means the blob could not
+/// be opened, in which case the node keeps whatever it already had — a fresh
+/// state — rather than a partially restored one.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeImportState(
+    mut env: JNIEnv,
+    _class: JClass,
+    vault_key: JByteArray,
+    blob: JByteArray,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        let key = match read_vault_key(&mut env, &vault_key) {
+            Some(k) => k,
+            None => return JNI_FALSE,
+        };
+        let bytes = match env.convert_byte_array(&blob) {
+            Ok(b) => b,
+            Err(_) => return JNI_FALSE,
+        };
+        bool_out(with_node!(JNI_FALSE, |node| node
+            .import_secure_state(&key, &bytes)
+            .is_ok()))
+    })
+}
+
+/// Forgets every session, group key, and verification on this device.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeWipeSecureState(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    guard((), || {
+        if let Ok(slot) = NODE_INSTANCE.lock() {
+            if let Some(node) = slot.as_ref() {
+                node.wipe_secure_state();
+            }
+        }
+    })
+}
+
+fn read_vault_key(env: &mut JNIEnv, key: &JByteArray) -> Option<[u8; 32]> {
+    match env.convert_byte_array(key) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inbound
 // ---------------------------------------------------------------------------
 
@@ -358,11 +749,18 @@ struct ReceiveResultJson {
     ack_packet_hex: Option<String>,
     /// Hex of the next handshake message to transmit back.
     handshake_reply_hex: Option<String>,
-    /// Decrypted chat text, present only for chat addressed to us.
+    /// Decrypted text: private chat addressed to us, or a group message this
+    /// device holds the key for.
     plaintext: Option<String>,
     /// Public SOS text. Broadcast SOS is intentionally unencrypted so any
     /// responder in range can read it.
     sos_text: Option<String>,
+    /// Set when the packet belonged to a group this device is a member of.
+    group_id: Option<String>,
+    group_name: Option<String>,
+    /// "Joined", "Rekeyed", "Removed", or "Stale" when an invite changed this
+    /// device's membership.
+    group_event: Option<&'static str>,
 }
 
 fn packet_type_name(t: PacketType) -> &'static str {
@@ -373,6 +771,17 @@ fn packet_type_name(t: PacketType) -> &'static str {
         PacketType::Ack => "Ack",
         PacketType::ResourcePin => "ResourcePin",
         PacketType::NoiseHandshake => "NoiseHandshake",
+        PacketType::GroupInvite => "GroupInvite",
+        PacketType::GroupChat => "GroupChat",
+    }
+}
+
+fn invite_outcome_name(outcome: &InviteOutcome) -> &'static str {
+    match outcome {
+        InviteOutcome::Joined => "Joined",
+        InviteOutcome::Rekeyed => "Rekeyed",
+        InviteOutcome::Removed => "Removed",
+        InviteOutcome::Stale => "Stale",
     }
 }
 
@@ -435,6 +844,9 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeProcess
                 .plaintext
                 .and_then(|p| String::from_utf8(p).ok()),
             sos_text,
+            group_id: outcome.group_id.as_ref().map(|g| to_hex(g)),
+            group_name: outcome.group_name.clone(),
+            group_event: outcome.group_event.as_ref().map(invite_outcome_name),
         };
 
         json_out(&mut env, &result)

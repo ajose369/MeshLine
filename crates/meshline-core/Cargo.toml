@@ -18,6 +18,9 @@ bincode = "1.3"
 lru = "0.12"
 thiserror = "1.0"
 uuid = { version = "1.6", features = ["v4", "serde"] }
-snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+# `risky-raw-split` exposes the post-handshake split keys. We need them because
+# `snow`'s own transport state cannot be serialized, and a session that dies with
+# the process forces a fresh handshake on every app restart.
+snow = { version = "0.9", default-features = false, features = ["default-resolver", "risky-raw-split"] }
 hex = "0.4"
 subtle = "2.5"

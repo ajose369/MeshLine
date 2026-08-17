@@ -31,11 +31,20 @@ advertising identifier, and no third-party analytics library in the build.
 |---|---|---|
 | Mesh identity key | Signs your messages so others can verify they are genuinely from you | Only the public half, inside messages you send |
 | Messages you send and receive | Displayed in the app | Only as you direct (see below) |
+| Session and group keys | Encrypt your private chats and groups | No — only ciphertext produced with them |
+| Which contacts you have verified | Shows whether an identity has been checked in person | No |
 | Resource pins | Shown on your Pins screen | Only pins you choose to create |
 | Approximate positions of received pins | Shown relative to you | No |
 
-The mesh identity key is encrypted with a key held in the Android Keystore and is
-excluded from cloud backup and device transfer.
+All of this is encrypted on your device with keys held in the Android Keystore,
+and excluded from cloud backup and device transfer. Your message history is
+stored encrypted and capped at the most recent 2000 messages.
+
+You can destroy all of it at any time with **Wipe all secure data** on the Radar
+screen. That deletes every session key, group key, and stored message. It cannot
+recall anything already sent, and it does not hide that MeshLine is installed.
+Your mesh identity is deliberately kept, so that contacts who verified you still
+recognise your device.
 
 ## What is transmitted, and when
 
@@ -50,6 +59,12 @@ traffic for the mesh:
 - **When you send a chat message**: the text is end-to-end encrypted (Noise-XX)
   and can only be read by the recipient you selected. Devices that relay it
   cannot read it.
+- **When you send a group message**: the text is end-to-end encrypted to that
+  group's members only. Devices that relay it cannot read it, and cannot tell
+  which group it belongs to — the packet is addressed to a value derived from
+  the group key rather than to the group's name. What a nearby observer *can*
+  see is that some group is active and which devices are transmitting for it.
+  Message contents, the group's name, and its member list stay private.
 - **When you create a resource pin**: the label, the pin type, and the
   coordinates of the pin are broadcast unencrypted so others can find the
   resource.

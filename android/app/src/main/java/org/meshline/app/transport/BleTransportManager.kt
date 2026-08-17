@@ -47,8 +47,16 @@ class BleTransportManager(private val context: Context) {
         val MESHLINE_SERVICE_UUID: UUID = UUID.fromString("0000FE60-0000-1000-8000-00805F9B34FB")
         val MESHLINE_CHAR_UUID: UUID = UUID.fromString("0000FE61-0000-1000-8000-00805F9B34FB")
 
-        /** Conservative ATT payload budget; larger frames are chunked by the caller. */
-        private const val MAX_ATT_PAYLOAD = 512
+        /**
+         * Largest single GATT write we will accept: exactly what the largest
+         * negotiable MTU can carry.
+         *
+         * Derived rather than written as a literal. The previous hard-coded 512
+         * was two bytes short of a full write at the maximum MTU, which would
+         * have rejected precisely the frames a well-negotiated link produces.
+         */
+        private const val MAX_ATT_PAYLOAD =
+            PacketFraming.MAX_MTU - PacketFraming.ATT_WRITE_OVERHEAD
     }
 
     private val bluetoothManager: BluetoothManager? by lazy {
@@ -63,13 +71,28 @@ class BleTransportManager(private val context: Context) {
     private val connectedDevices = Collections.synchronizedSet(mutableSetOf<String>())
     private val peerCount = AtomicInteger(0)
 
+    /** One BLE write, and which packet it belongs to. */
+    private data class Frame(val packetIndex: Int, val bytes: ByteArray)
+
     private data class WriteQueueState(
         val packets: List<ByteArray>,
+        val frames: List<Frame>,
         var index: Int,
         val characteristic: BluetoothGattCharacteristic
     )
 
     private val writeStates = ConcurrentHashMap<String, WriteQueueState>()
+
+    /** Negotiated ATT MTU per peer, until one is agreed. */
+    private val negotiatedMtu = ConcurrentHashMap<String, Int>()
+
+    /**
+     * Inbound reassembly. Guarded by its own lock rather than a concurrent map,
+     * because completing a packet is a read-modify-write across several fields
+     * and BLE callbacks arrive on a binder thread.
+     */
+    private val reassembler = PacketReassembler()
+    private val reassemblyLock = Any()
 
     val activePeersCount: Int get() = peerCount.get()
 
@@ -142,6 +165,8 @@ class BleTransportManager(private val context: Context) {
             bleScanner = null
             connectedDevices.clear()
             writeStates.clear()
+            negotiatedMtu.clear()
+            synchronized(reassemblyLock) { reassembler.clear() }
             peerCount.set(0)
         }
     }
@@ -186,7 +211,13 @@ class BleTransportManager(private val context: Context) {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        bleScanner?.startScan(listOf(filter), settings, scanCallback)
+        // The grant is checked above, but it can be revoked between that check
+        // and this call, which would take the relay service down with it.
+        try {
+            bleScanner?.startScan(listOf(filter), settings, scanCallback)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Scan permission revoked before the scan started.", e)
+        }
     }
 
     private fun connectToPeer(device: BluetoothDevice) {
@@ -210,22 +241,53 @@ class BleTransportManager(private val context: Context) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     peerCount.incrementAndGet()
-                    if (MeshPermissions.canConnect(context)) {
-                        try {
-                            gatt.discoverServices()
-                        } catch (e: SecurityException) {
-                            Log.w(TAG, "Discover permission revoked.", e)
-                        }
+                    if (!MeshPermissions.canConnect(context)) return
+
+                    // Ask for the largest MTU before anything else. Every packet
+                    // this app produces is larger than the 23-byte default, so
+                    // at the default a packet takes 20 fragments where it could
+                    // take one. Fragmentation still covers us if this fails.
+                    val requested = try {
+                        gatt.requestMtu(PacketFraming.MAX_MTU)
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "MTU permission revoked.", e)
+                        false
+                    }
+
+                    if (!requested) {
+                        Log.w(TAG, "MTU request refused for $address; using the default.")
+                        discoverServicesQuietly(gatt)
                     }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     connectedDevices.remove(address)
-                    writeStates.remove(address)
+                    negotiatedMtu.remove(address)
+                    // Anything half-written is requeued rather than lost: these
+                    // packets were removed from the store's outbound queue when
+                    // the connection began.
+                    requeueUnsent(address)
+                    synchronized(reassemblyLock) { reassembler.forgetDevice(address) }
                     closeQuietly(gatt)
                 }
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            gatt ?: return
+            val address = try {
+                gatt.device?.address ?: return
+            } catch (e: SecurityException) {
+                return
+            }
+
+            // A failed negotiation is not fatal; it just means smaller frames.
+            val agreed = if (status == BluetoothGatt.GATT_SUCCESS) mtu else PacketFraming.DEFAULT_MTU
+            negotiatedMtu[address] = agreed
+            Log.i(TAG, "MTU for $address is $agreed (${PacketFraming.payloadCapacity(agreed)} B per frame).")
+
+            discoverServicesQuietly(gatt)
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
@@ -242,23 +304,40 @@ class BleTransportManager(private val context: Context) {
                 return
             }
 
-            val packets = StoreAndForwardManager.getInstance(context)
-                .drainOutbound()
-                .filter { it.size <= MAX_ATT_PAYLOAD }
-
-            if (packets.isEmpty()) {
-                disconnectQuietly(gatt)
-                return
-            }
-
             val address = try {
                 gatt.device.address
             } catch (e: SecurityException) {
                 return
             }
-            val state = WriteQueueState(packets, 0, characteristic)
+
+            val packets = StoreAndForwardManager.getInstance(context).drainOutbound()
+            if (packets.isEmpty()) {
+                disconnectQuietly(gatt)
+                return
+            }
+
+            val mtu = negotiatedMtu[address] ?: PacketFraming.DEFAULT_MTU
+            val frames = ArrayList<Frame>()
+            packets.forEachIndexed { packetIndex, packet ->
+                val fragments = PacketFraming.fragment(packet, mtu)
+                if (fragments.isEmpty()) {
+                    // Refusing is the honest outcome: a packet this size cannot
+                    // be delivered, and sending a prefix of it would produce a
+                    // signature failure at the far end instead of an error here.
+                    Log.w(TAG, "Dropping a ${packet.size}-byte packet that cannot be framed.")
+                } else {
+                    fragments.forEach { frames += Frame(packetIndex, it) }
+                }
+            }
+
+            if (frames.isEmpty()) {
+                disconnectQuietly(gatt)
+                return
+            }
+
+            val state = WriteQueueState(packets, frames, 0, characteristic)
             writeStates[address] = state
-            sendNextPacket(gatt, state)
+            sendNextFrame(gatt, state)
         }
 
         override fun onCharacteristicWrite(
@@ -275,16 +354,50 @@ class BleTransportManager(private val context: Context) {
             val state = writeStates[address]
             if (state == null) {
                 disconnectQuietly(gatt)
-            } else {
-                sendNextPacket(gatt, state)
+                return
             }
+
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // Carrying on would send the remaining fragments of a packet
+                // whose earlier fragments never arrived, which can only ever
+                // reassemble into rubbish. Stop and put the rest back.
+                Log.w(TAG, "Write to $address failed with status $status; requeuing the rest.")
+                requeueUnsent(address)
+                writeStates.remove(address)
+                disconnectQuietly(gatt)
+                return
+            }
+
+            sendNextFrame(gatt, state)
         }
     }
 
-    private fun sendNextPacket(gatt: BluetoothGatt, state: WriteQueueState) {
+    /**
+     * Returns packets that were drained for a connection but never fully
+     * written, so a dropped link delays delivery instead of destroying it.
+     */
+    private fun requeueUnsent(address: String) {
+        val state = writeStates.remove(address) ?: return
+        val firstUnsent = state.frames.getOrNull(state.index)?.packetIndex ?: return
+        val store = StoreAndForwardManager.getInstance(context)
+        for (i in firstUnsent until state.packets.size) {
+            store.queueRawPacket(state.packets[i])
+        }
+    }
+
+    private fun discoverServicesQuietly(gatt: BluetoothGatt) {
+        if (!MeshPermissions.canConnect(context)) return
+        try {
+            gatt.discoverServices()
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Discover permission revoked.", e)
+        }
+    }
+
+    private fun sendNextFrame(gatt: BluetoothGatt, state: WriteQueueState) {
         if (!MeshPermissions.canConnect(context)) return
 
-        if (state.index >= state.packets.size) {
+        if (state.index >= state.frames.size) {
             try {
                 writeStates.remove(gatt.device.address)
             } catch (e: SecurityException) {
@@ -294,19 +407,19 @@ class BleTransportManager(private val context: Context) {
             return
         }
 
-        val packet = state.packets[state.index]
+        val frame = state.frames[state.index].bytes
         state.index++
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeCharacteristic(
                     state.characteristic,
-                    packet,
+                    frame,
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 )
             } else {
                 @Suppress("DEPRECATION")
-                state.characteristic.value = packet
+                state.characteristic.value = frame
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(state.characteristic)
             }
@@ -320,31 +433,59 @@ class BleTransportManager(private val context: Context) {
         if (!MeshPermissions.canConnect(context)) return
         val manager = bluetoothManager ?: return
 
-        gattServer = manager.openGattServer(context, gattServerCallback)
+        // As with scanning, the grant checked above can disappear underneath
+        // this call. A relay that cannot open its server is degraded; a relay
+        // that crashes takes every carried packet with it.
+        try {
+            gattServer = manager.openGattServer(context, gattServerCallback)
 
-        val service = BluetoothGattService(
-            MESHLINE_SERVICE_UUID,
-            BluetoothGattService.SERVICE_TYPE_PRIMARY
-        )
-        val characteristic = BluetoothGattCharacteristic(
-            MESHLINE_CHAR_UUID,
-            BluetoothGattCharacteristic.PROPERTY_READ or
-                BluetoothGattCharacteristic.PROPERTY_WRITE or
-                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ or
-                BluetoothGattCharacteristic.PERMISSION_WRITE
-        )
-        service.addCharacteristic(characteristic)
-        gattServer?.addService(service)
+            val service = BluetoothGattService(
+                MESHLINE_SERVICE_UUID,
+                BluetoothGattService.SERVICE_TYPE_PRIMARY
+            )
+            val characteristic = BluetoothGattCharacteristic(
+                MESHLINE_CHAR_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                BluetoothGattCharacteristic.PERMISSION_READ or
+                    BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            service.addCharacteristic(characteristic)
+            gattServer?.addService(service)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Connect permission revoked before the GATT server opened.", e)
+            gattServer = null
+        }
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
+            val address = try {
+                device?.address
+            } catch (e: SecurityException) {
+                null
+            }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> peerCount.incrementAndGet()
-                BluetoothProfile.STATE_DISCONNECTED ->
+                BluetoothProfile.STATE_DISCONNECTED -> {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
+                    // A peer that vanishes mid-packet must not leave its
+                    // fragments occupying the reassembly table.
+                    address?.let { addr ->
+                        synchronized(reassemblyLock) { reassembler.forgetDevice(addr) }
+                    }
+                }
             }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
+            val address = try {
+                device?.address ?: return
+            } catch (e: SecurityException) {
+                return
+            }
+            negotiatedMtu[address] = mtu
         }
 
         override fun onCharacteristicWriteRequest(
@@ -361,9 +502,24 @@ class BleTransportManager(private val context: Context) {
                 value.size <= MAX_ATT_PAYLOAD
 
             if (accepted) {
-                // Authenticity is decided by the native core, not by us.
-                StoreAndForwardManager.getInstance(context)
-                    .processIncomingPacket(value!!, transport = "Bluetooth LE")
+                // Frames are reassembled here, but nothing is trusted here: the
+                // result goes straight to the native core, which decides
+                // authenticity. Keying by device address means one peer cannot
+                // interfere with another's part-built packets.
+                val deviceKey = try {
+                    device?.address ?: "unknown"
+                } catch (e: SecurityException) {
+                    "unknown"
+                }
+
+                val packet = synchronized(reassemblyLock) {
+                    reassembler.accept(deviceKey, value!!, System.currentTimeMillis())
+                }
+
+                if (packet != null) {
+                    StoreAndForwardManager.getInstance(context)
+                        .processIncomingPacket(packet, transport = "Bluetooth LE")
+                }
             }
 
             if (responseNeeded && device != null && MeshPermissions.canConnect(context)) {
