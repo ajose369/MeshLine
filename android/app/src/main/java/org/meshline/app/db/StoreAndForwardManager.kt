@@ -113,8 +113,14 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * Returns false when the core is unavailable, in which case nothing is
      * queued and the caller must tell the user the SOS did not send.
      */
-    fun sendSos(text: String, latitude: Float, longitude: Float): Boolean {
-        val packet = MeshCoreBridge.createSos(text, latitude, longitude)
+    /** Nulls mean the device had no fix; the packet then carries no location. */
+    fun sendSos(
+        text: String,
+        latitude: Double? = null,
+        longitude: Double? = null,
+        accuracyMeters: Float? = null,
+    ): Boolean {
+        val packet = MeshCoreBridge.createSos(text, latitude, longitude, accuracyMeters)
         if (packet == null) {
             Log.e(TAG, "SOS could not be created; mesh core unavailable.")
             recordLocalMessage(text, "PublicSos", MessageStatus.FAILED)

@@ -149,10 +149,15 @@ fun SosScreen() {
                         // Send with or without coordinates. A distress
                         // call with no position still beats no call, so
                         // a missing fix must never block the broadcast.
+                        // Pass the fix through as-is, or nothing at all. The
+                        // old `?: 0f` fallback broadcast a signed pin at
+                        // (0, 0) whenever location was unavailable, while
+                        // this screen told the user no coordinates were sent.
                         val sent = store.sendSos(
                             text = sosMessageText,
-                            latitude = current?.latitude?.toFloat() ?: 0f,
-                            longitude = current?.longitude?.toFloat() ?: 0f
+                            latitude = current?.latitude,
+                            longitude = current?.longitude,
+                            accuracyMeters = current?.accuracyMeters
                         )
                         if (sent) {
                             SosResult.Sent(hadLocation = current != null)
