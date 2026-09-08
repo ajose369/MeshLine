@@ -224,19 +224,25 @@ impl MeshNode {
         msg_id
     }
 
+    /// Broadcast a distress call, with a position only if one was actually
+    /// measured.
+    ///
+    /// `location` is `None` when the device has no fix. Zero is a real
+    /// coordinate in the Gulf of Guinea, not a missing-value sentinel: the
+    /// previous signature took bare `lat`/`lon` and always attached a
+    /// `LocationTag`, so a phone with location denied broadcast a signed pin
+    /// off the coast of Africa while the UI said no coordinates were sent.
+    /// The accuracy now travels with the fix instead of being hardcoded to
+    /// 5 m, which claimed a precision no measurement supported.
     pub fn create_public_sos(
         &self,
         sos_message: &str,
-        lat: f32,
-        lon: f32,
+        location: Option<LocationTag>,
     ) -> Result<Packet, MeshError> {
-        let location = LocationTag {
-            latitude: lat,
-            longitude: lon,
-            accuracy_meters: 5,
-        };
-        if !location.is_valid() {
-            return Err(MeshError::Packet(PacketError::InvalidLocation));
+        if let Some(loc) = location.as_ref() {
+            if !loc.is_valid() {
+                return Err(MeshError::Packet(PacketError::InvalidLocation));
+            }
         }
 
         let payload_bytes = sos_message.as_bytes().to_vec();
@@ -250,7 +256,7 @@ impl MeshNode {
             PacketType::PublicSos,
             Self::random_msg_id(),
             [0u8; 16],
-            Some(location),
+            location,
             pow_nonce,
             payload_bytes,
         )
@@ -807,6 +813,17 @@ impl Default for MeshNode {
 
 #[cfg(test)]
 mod tests {
+
+    /// A measured fix, for tests that need one. Production callers pass
+    /// `None` when the device has no fix rather than a stand-in coordinate.
+    fn at(lat: f32, lon: f32) -> Option<LocationTag> {
+        Some(LocationTag {
+            latitude: lat,
+            longitude: lon,
+            accuracy_meters: 10,
+        })
+    }
+
     use super::*;
 
     fn wire(packet: &Packet) -> Vec<u8> {
@@ -831,7 +848,7 @@ mod tests {
     fn accepts_a_genuine_sos() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let sos = sender.create_public_sos("trapped, third floor", 12.9, 77.5).unwrap();
+        let sos = sender.create_public_sos("trapped, third floor", at(12.9, 77.5)).unwrap();
 
         let outcome = receiver.process_incoming(&wire(&sos)).unwrap();
         assert!(outcome.should_relay);
@@ -844,7 +861,7 @@ mod tests {
     fn rejects_forged_sos() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let sos = sender.create_public_sos("help", 12.9, 77.5).unwrap();
+        let sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
 
         let mut bytes = wire(&sos);
         // Flip a byte inside the signed payload region.
@@ -858,7 +875,7 @@ mod tests {
     fn rejects_sos_with_rewritten_location() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let mut sos = sender.create_public_sos("help", 12.9, 77.5).unwrap();
+        let mut sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
         sos.header.location = Some(LocationTag {
             latitude: -33.0,
             longitude: 151.0,
@@ -871,7 +888,7 @@ mod tests {
     fn rejects_sos_without_proof_of_work() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let mut sos = sender.create_public_sos("help", 12.9, 77.5).unwrap();
+        let mut sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
         sos.header.pow_nonce = 0;
         // Re-sign so the failure is attributable to PoW, not the signature.
         sos.signature = sender
@@ -889,7 +906,7 @@ mod tests {
     fn duplicate_packets_are_not_relayed_twice() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let sos = sender.create_public_sos("help", 12.9, 77.5).unwrap();
+        let sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
         let bytes = wire(&sos);
 
         assert!(receiver.process_incoming(&bytes).unwrap().should_relay);
@@ -902,7 +919,7 @@ mod tests {
         let relay = MeshNode::new();
         let far = MeshNode::new();
 
-        let sos = sender.create_public_sos("help", 12.9, 77.5).unwrap();
+        let sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
         let hop1 = relay.process_incoming(&wire(&sos)).unwrap();
         assert!(hop1.should_relay);
 
@@ -1062,7 +1079,7 @@ mod tests {
         let receiver = MeshNode::new();
 
         // Attacker forges the victim's sender_id onto its own signed packet.
-        let mut forged = attacker.create_public_sos("fake", 1.0, 1.0).unwrap();
+        let mut forged = attacker.create_public_sos("fake", at(1.0, 1.0)).unwrap();
         forged.header.sender_id = victim_identity.node_id;
         forged.signature = attacker
             .signing_key
@@ -1076,7 +1093,7 @@ mod tests {
         ));
 
         // The victim's own traffic must be unaffected.
-        let genuine = victim_identity.create_public_sos("real", 1.0, 1.0).unwrap();
+        let genuine = victim_identity.create_public_sos("real", at(1.0, 1.0)).unwrap();
         assert!(receiver.process_incoming(&wire(&genuine)).unwrap().should_relay);
     }
 
@@ -1085,7 +1102,7 @@ mod tests {
         let node = MeshNode::new();
         let huge = "x".repeat(MAX_PAYLOAD_BYTES + 1);
         assert!(matches!(
-            node.create_public_sos(&huge, 1.0, 1.0),
+            node.create_public_sos(&huge, at(1.0, 1.0)),
             Err(MeshError::PayloadTooLarge)
         ));
     }
@@ -1102,8 +1119,8 @@ mod tests {
     #[test]
     fn invalid_coordinates_are_refused() {
         let node = MeshNode::new();
-        assert!(node.create_public_sos("help", f32::NAN, 0.0).is_err());
-        assert!(node.create_public_sos("help", 200.0, 0.0).is_err());
+        assert!(node.create_public_sos("help", at(f32::NAN, 0.0)).is_err());
+        assert!(node.create_public_sos("help", at(200.0, 0.0)).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1534,6 +1551,39 @@ mod tests {
         assert_eq!(
             bob.process_incoming(&wire(&chat)).unwrap().plaintext.as_deref(),
             Some(&b"back online"[..])
+        );
+    }
+
+    #[test]
+    fn sos_without_a_fix_carries_no_location_at_all() {
+        // The UI says "no coordinates attached" when there is no fix. The
+        // packet must agree: previously it shipped (0, 0) - a real point in
+        // the Gulf of Guinea - stamped with an invented 5 m accuracy.
+        let node = MeshNode::new();
+        let sos = node.create_public_sos("trapped, no signal", None).unwrap();
+        assert!(
+            sos.header.location.is_none(),
+            "an SOS with no fix must carry no LocationTag"
+        );
+    }
+
+    #[test]
+    fn sos_carries_the_measured_accuracy_not_a_constant() {
+        let node = MeshNode::new();
+        let sos = node
+            .create_public_sos(
+                "help",
+                Some(LocationTag {
+                    latitude: 12.9,
+                    longitude: 77.5,
+                    accuracy_meters: 47,
+                }),
+            )
+            .unwrap();
+        let loc = sos.header.location.expect("a measured fix must be carried");
+        assert_eq!(
+            loc.accuracy_meters, 47,
+            "accuracy must travel with the fix, not be hardcoded to 5"
         );
     }
 }

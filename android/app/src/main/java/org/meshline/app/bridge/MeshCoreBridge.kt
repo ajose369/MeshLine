@@ -111,8 +111,28 @@ object MeshCoreBridge {
 
     fun publicKey(): ByteArray? = guarded { nativePublicKey() }
 
-    fun createSos(message: String, latitude: Float, longitude: Float): ByteArray? =
-        guarded { nativeCreateSos(message, latitude, longitude) }
+    /**
+     * Build a distress packet, attaching a position only if one was measured.
+     *
+     * Nulls mean "no fix". Zero is a real coordinate in the Gulf of Guinea,
+     * so absence must be carried explicitly - passing 0f previously made
+     * every fixless SOS claim a position off the coast of Africa.
+     */
+    fun createSos(
+        message: String,
+        latitude: Double?,
+        longitude: Double?,
+        accuracyMeters: Float?,
+    ): ByteArray? = guarded {
+        val hasFix = latitude != null && longitude != null
+        nativeCreateSos(
+            message,
+            hasFix,
+            latitude?.toFloat() ?: 0f,
+            longitude?.toFloat() ?: 0f,
+            accuracyMeters?.toInt() ?: 0,
+        )
+    }
 
     fun createPin(
         pinId: ByteArray,
@@ -248,7 +268,13 @@ object MeshCoreBridge {
     private external fun nativeIsReady(): Boolean
     private external fun nativeNodeIdHex(): String?
     private external fun nativePublicKey(): ByteArray?
-    private external fun nativeCreateSos(message: String, lat: Float, lon: Float): ByteArray?
+    private external fun nativeCreateSos(
+        message: String,
+        hasLocation: Boolean,
+        lat: Float,
+        lon: Float,
+        accuracyMeters: Int,
+    ): ByteArray?
     private external fun nativeCreatePin(
         pinIdBytes: ByteArray,
         pinTypeVal: Int,

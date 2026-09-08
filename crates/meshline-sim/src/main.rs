@@ -1,4 +1,4 @@
-use meshline_core::{BatteryPowerState, MeshNode};
+use meshline_core::{BatteryPowerState, LocationTag, MeshNode};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 struct MeshSimulator {
@@ -72,7 +72,14 @@ impl MeshSimulator {
     fn run_sos_simulation(&self, origin_idx: usize, message: &str) -> (usize, usize) {
         let origin = &self.nodes[origin_idx];
         let packet = origin
-            .create_public_sos(message, 37.7749, -122.4194)
+            .create_public_sos(
+                message,
+                Some(LocationTag {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    accuracy_meters: 10,
+                }),
+            )
             .expect("Packet failed");
 
         let raw_bytes = packet.to_bytes().expect("Serialization failed");
@@ -117,7 +124,14 @@ impl MeshSimulator {
     fn run_forgery_simulation(&self, origin_idx: usize) -> (usize, usize) {
         let origin = &self.nodes[origin_idx];
         let packet = origin
-            .create_public_sos("SOS: genuine distress call", 37.7749, -122.4194)
+            .create_public_sos(
+                "SOS: genuine distress call",
+                Some(LocationTag {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    accuracy_meters: 10,
+                }),
+            )
             .expect("Packet failed");
         let genuine = packet.to_bytes().expect("Serialization failed");
 
