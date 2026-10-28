@@ -247,9 +247,12 @@ def gemini_last_activity(state_b: dict | None = None) -> float:
     except OSError:
         pass
     try:
-        out = git(CLONES["B"], "for-each-ref", "--format=%(committerdate:unix)",
+        out = git(CLONES["B"], "for-each-ref", "--format=%(refname:short) %(committerdate:unix)",
                   "refs/remotes/origin/gemini/", "refs/remotes/origin/contract/")
-        times += [float(t) for t in out.split() if t.strip()]
+        for line in out.splitlines():
+            ref, _, ts = line.partition(" ")
+            if ref.startswith(("origin/gemini/", "origin/contract/gemini-")) and ts.strip():
+                times.append(float(ts))
     except Exception:
         pass
     for p in (state_b or {}).get("prs", []):

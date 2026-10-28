@@ -290,6 +290,12 @@ class LaneBMonitorTest(unittest.TestCase):
             self.assertLess(time.time() - supervisor.gemini_last_activity(s), 120)
             self.assertEqual(supervisor.gemini_last_activity(state()), 0.0)
 
+    def test_only_gemini_branches_count(self):
+        refs = "origin/contract/claude-fmt 1792000000\norigin/gemini/B-101-x 1791000000\n"
+        with mock.patch.object(supervisor, "GEMINI_HOOK_LOG", Path(tempfile.gettempdir()) / "no-such-hook.log"), \
+                mock.patch.object(supervisor, "git", return_value=refs):
+            self.assertEqual(supervisor.gemini_last_activity(state()), 1791000000.0)
+
     def test_status_warns_when_gemini_has_work_but_is_idle(self):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
