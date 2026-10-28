@@ -56,7 +56,8 @@ def main():
         files = [f for f in git("diff", "--name-only", f"{base}..{local_sha}").splitlines() if f]
         if files:
             r = subprocess.run([sys.executable, os.path.join(TOOLS_DIR, "check_owners.py"),
-                                "--branch", branch, "--files", *files], capture_output=True, text=True)
+                                "--branch", branch, "--files", *files], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 print("pre-push: " + r.stdout.strip(), file=sys.stderr)
                 failed = True
