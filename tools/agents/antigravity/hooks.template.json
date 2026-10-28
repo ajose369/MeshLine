@@ -1,0 +1,17 @@
+{
+  "{SLUG}-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python \"{RUNTIME}\\tools\\agents\\antigravity_hook.py\" pretool", "timeout": 60 }
+        ]
+      }
+    ]
+  },
+  "{SLUG}-autopilot": {
+    "Stop": [
+      { "type": "command", "command": "python \"{RUNTIME}\\tools\\agents\\antigravity_hook.py\" stop", "timeout": 300 }
+    ]
+  }
+}

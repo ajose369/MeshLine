@@ -1,0 +1,78 @@
+# Path ownership — enforced by tools/check_owners.py in CI on every PR, by the pre-push hook in
+# each lane clone, and by the autopilot guard on every file write.
+# CONTRACT FILE — changes only through a contract PR (AGENTS.md §3, §7).
+#
+# owner values:
+#   "A"        Lane A — Claude Code   (branches claude/…)    Rust core, JNI, Kotlin key handling
+#   "B"        Lane B — Gemini        (branches gemini/…)    the Android app, site, release docs
+#   "X"        the user               (agents never edit)
+#   "contract" shared; only on contract/<claude|gemini>-<slug> branches, the other lane reviews
+#   "any"      either lane may change it (e.g. Cargo.lock, new ADR files)
+#
+# Matching uses shell-style globs (`*` also crosses `/`). When several rules match,
+# the MOST SPECIFIC one wins (the one with the most literal, non-wildcard characters).
+# A path that matches no rule is treated as "contract" (this includes tools/agents/, the autopilot).
+
+[branches]
+A = "claude/"
+B = "gemini/"
+contract = "contract/"
+user = "user/"
+
+# ------------------------------------------------------------------ contract files
+[[rule]]
+paths = [
+  # rulebook, plan, project-wide config
+  "OWNERS.toml", "AGENTS.md", "README.md", "PRIVACY.md", "docs/PLAN.md",
+  ".gitignore", ".gitattributes", ".github/*",
+  "tools/board.py", "tools/check_owners.py", "tools/test_coordination.py",
+  "tasks/README.md", "tasks/_TEMPLATE.md", "tasks/_RFC_TEMPLATE.md",
+  # Rust workspace
+  "Cargo.toml", "rustfmt.toml", "clippy.toml", "rust-toolchain.toml", "deny.toml",
+  # the wire format: every installed phone must keep understanding every other one
+  "crates/meshline-core/src/packet/schema.rs",
+  # Android build: both lanes depend on it (cargo-ndk wiring, dependencies, R8 keep rules for JNI)
+  "android/build.gradle.kts", "android/settings.gradle.kts", "android/gradle.properties",
+  "android/gradle/*", "android/gradlew", "android/gradlew.bat",
+  "android/app/build.gradle.kts", "android/app/proguard-rules.pro",
+]
+owner = "contract"
+
+[[rule]]
+paths = ["Cargo.lock", "docs/decisions/*"]
+owner = "any"
+
+# ------------------------------------------------------------------ Lane A — Claude Code
+[[rule]]
+paths = [
+  "CLAUDE.md",
+  "crates/*",
+  # both sides of the JNI boundary
+  "android/app/src/main/java/org/meshline/app/bridge/*",
+  "android/app/src/test/java/org/meshline/app/bridge/*",
+  # Keystore, identity, sealed state, encrypted history (key and nonce handling)
+  "android/app/src/main/java/org/meshline/app/security/*",
+  "android/app/src/test/java/org/meshline/app/security/*",
+  "android/app/src/main/java/org/meshline/app/db/EncryptedMessageStore.kt",
+  "android/app/src/test/java/org/meshline/app/db/EncryptedMessageStore*",
+  "docs/protocol.md", "docs/security/*",
+  "tasks/A-*", "docs/handoff/claude.md",
+]
+owner = "A"
+
+# ------------------------------------------------------------------ Lane B — Gemini
+[[rule]]
+paths = [
+  "GEMINI.md",
+  # the Android app: BLE transport, relay service, persistence, location, permissions, UI, resources
+  "android/*",
+  "site/*",
+  "RELEASE.md", "docs/user/*", "docs/release/*", "tools/release/*",
+  "tasks/B-*", "docs/handoff/gemini.md",
+]
+owner = "B"
+
+# ------------------------------------------------------------------ the user
+[[rule]]
+paths = ["tasks/X-*", "REVIEW.md", "offline-mesh-comms-plan.md"]
+owner = "X"

@@ -1,0 +1,80 @@
+# CONTRACT FILE — changes only through a contract PR (AGENTS.md §3, §7).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Policy (ownership, tasks, Python tools)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ownership check (OWNERS.toml)
+        if: github.event_name == 'pull_request'
+        run: python tools/check_owners.py --branch "${{ github.head_ref }}" --base "origin/${{ github.base_ref }}"
+      - name: Task files valid
+        run: python tools/board.py --validate
+      - name: Python tool tests
+        # Convention: every tools/<name>/ with test_*.py files is tested here. A tool that needs
+        # third-party packages lists them in tools/<name>/requirements.txt.
+        shell: bash
+        run: |
+          git config --global user.email ci@example.invalid
+          git config --global user.name CI
+          status=0
+          for d in tools/ tools/*/; do
+            ls "$d"test_*.py >/dev/null 2>&1 || continue
+            if [ -f "${d}requirements.txt" ]; then python -m pip install --quiet -r "${d}requirements.txt"; fi
+            echo "::group::python tests: $d"
+            python -m unittest discover -s "$d" -p "test_*.py" -v || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        # Non-blocking until A-001 formats the imported code; A-001 removes this line.
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Simulator assertions (reachability, SOS priority, forgery rejection)
+        run: cargo run -q -p meshline-sim
+
+  android:
+    name: Android (unit tests, lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests and lint (native core not built; B-001 adds that job)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest lintDebug -Pmeshline.skipRustBuild=true
