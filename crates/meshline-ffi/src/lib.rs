@@ -17,8 +17,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use meshline_core::{
-    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, MeshNode, PacketType,
-    ResourcePinType,
+    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag,
+    MeshNode, PacketType, ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -194,20 +194,34 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativePublicK
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
+/// `has_location` is false when the device had no fix. Zero is a real
+/// coordinate, so absence has to be carried explicitly rather than encoded as
+/// (0, 0); `accuracy_m` is the fix's own measured accuracy, not a constant.
 pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCreateSos(
     mut env: JNIEnv,
     _class: JClass,
     message: JString,
+    has_location: jboolean,
     lat: f32,
     lon: f32,
+    accuracy_m: jint,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
         let msg = match read_string(&mut env, &message) {
             Some(m) => m,
             None => return std::ptr::null_mut(),
         };
+        let location = if has_location != 0 {
+            Some(LocationTag {
+                latitude: lat,
+                longitude: lon,
+                accuracy_meters: accuracy_m.max(0) as u32,
+            })
+        } else {
+            None
+        };
         let packet = with_node!(std::ptr::null_mut(), |node| node
-            .create_public_sos(&msg, lat, lon)
+            .create_public_sos(&msg, location)
             .and_then(|p| p.to_bytes().map_err(Into::into)));
 
         match packet {
