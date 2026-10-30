@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 31+ backup and device-transfer rules.
+
+  See backup_rules.xml for why the mesh identity is never included: the wrapping
+  key is device-bound, and a duplicated identity would mean two nodes sharing one
+  mesh id.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="meshline_identity.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="meshline_identity.xml" />
+    </device-transfer>
+</data-extraction-rules>

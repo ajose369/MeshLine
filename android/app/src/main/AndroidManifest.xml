@@ -1,34 +1,60 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- BLE Permissions -->
+    <!-- Bluetooth: legacy grants are install-time and capped below Android 12. -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+
+    <!--
+      Android 12+ runtime Bluetooth permissions. neverForLocation asserts we do
+      not derive the user's location from scan results, which is true: position
+      comes from the location provider and only when the user sends an SOS or pin.
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- Wi-Fi & Location Permissions for Mesh Discovery & GIS Pins -->
+    <!--
+      Fine location is required for BLE scanning below Android 12, and for the
+      coordinates attached to an SOS or resource pin on every release.
+    -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
 
-    <!-- Foreground Service & Battery Optimization -->
+    <!--
+      Wi-Fi Direct and USB/LoRa permissions are intentionally absent. Those
+      transports are not implemented in this release, and Play's Data Safety
+      review reasonably asks why an app requests a permission it never uses.
+      Declare them again alongside the code that actually needs them.
+    -->
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+      REQUEST_IGNORE_BATTERY_OPTIMIZATIONS is intentionally NOT declared. Google
+      Play restricts it to apps whose core function is genuinely broken by Doze,
+      and requires a policy declaration. The relay is a foreground service, which
+      is the sanctioned mechanism, so the restricted permission is not needed.
+    -->
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 
     <application
+        android:name=".MeshLineApplication"
         android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="MeshLine"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:theme="@style/Theme.MeshLine"
+        tools:targetApi="31">
 
         <service
             android:name=".service.MeshRelayService"
@@ -39,7 +65,9 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:theme="@style/Theme.MeshLine">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

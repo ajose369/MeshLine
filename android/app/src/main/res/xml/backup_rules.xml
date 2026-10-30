@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Legacy (API 23-30) auto-backup rules.
+
+  The mesh identity is excluded deliberately. It is wrapped by an Android
+  Keystore key that never leaves the device, so a restored copy on another
+  handset could not be decrypted anyway; worse, restoring the same identity onto
+  a second device would put two nodes on the mesh claiming one id.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="meshline_identity.xml" />
+</full-backup-content>

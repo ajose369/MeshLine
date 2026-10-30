@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      The Compose layer owns all in-app colour (see ui/theme/Theme.kt). This
+      theme only needs to cover the window before Compose takes over, so it
+      matches ObsidianBackground to avoid a white flash on a dark UI at launch.
+    -->
+    <style name="Theme.MeshLine" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/obsidian_background</item>
+        <item name="android:statusBarColor">@color/obsidian_background</item>
+        <item name="android:navigationBarColor">@color/obsidian_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
