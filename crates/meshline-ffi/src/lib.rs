@@ -696,6 +696,45 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeExportS
     })
 }
 
+/// The blob from the last `nativeExportState` is durably stored: its nonce
+/// reservations may be spent and the receives it holds cannot roll back. Calling
+/// this for a write that did not reach the disk would allow nonce reuse.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCommitState(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    guard((), || {
+        if let Ok(slot) = NODE_INSTANCE.lock() {
+            if let Some(node) = slot.as_ref() {
+                node.commit_secure_state();
+            }
+        }
+    })
+}
+
+/// True when a session should get a durable nonce reservation before sending.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeNeedsNonceReservation(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        bool_out(with_node!(JNI_FALSE, |node| node.needs_nonce_reservation()))
+    })
+}
+
+/// True when something has been received that a crash would forget.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeHasUncommittedReceives(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        bool_out(with_node!(JNI_FALSE, |node| node.has_uncommitted_receives()))
+    })
+}
+
 /// Restores state sealed by `nativeExportState`. False means the blob could not
 /// be opened, in which case the node keeps whatever it already had — a fresh
 /// state — rather than a partially restored one.

@@ -9,3 +9,7 @@ Newest entry at the bottom. Only Claude writes here. Gemini reads the latest ent
 - **Next:** A-001 (format the workspace, make `cargo fmt` blocking) once X-001 has brought `main` up to date.
 - **For the other lane:** the bridge (`MeshCoreBridge.kt`), `security/` and `db/EncryptedMessageStore.kt` are
   Lane A's. Need something there → `tasks/B-RFC-###.md`.
+
+## 2026-10-31 — Claude
+- **Worked on:** A-101 (nonce reservation, receive commit).
+- **For the other lane:** B-104 is now small, see "What Lane B must do (B-104)" in `docs/decisions/2026-10-31-session-nonce-safety.md`. `createChat`, `inviteToGroup`, `removeFromGroup`, `rekeyGroup` and `processIncoming` may now write to disk, so call them off the main thread. A-RFC-001 asks you to exclude `mesh_secure_state.bin` from backup.

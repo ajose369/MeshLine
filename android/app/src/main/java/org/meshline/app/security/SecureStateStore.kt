@@ -3,6 +3,10 @@ package org.meshline.app.security
 import android.content.Context
 import android.util.Log
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption
 import org.meshline.app.bridge.MeshCoreBridge
 
 /**
@@ -63,7 +67,13 @@ object SecureStateStore {
      * The write goes to a temporary file first: a process killed mid-write must
      * not be able to leave a half-written blob where a complete one used to be,
      * because that would silently lose every session on the device.
+     *
+     * Export, write and commit are one synchronized step, and the commit comes
+     * last. The core will not spend a nonce the disk does not cover, so an older
+     * blob landing on top of a newer one, or a commit for a write that never
+     * reached the disk, is exactly how a nonce would get reused.
      */
+    @Synchronized
     fun persist(context: Context): Boolean {
         val key = vaultKey(context) ?: return false
         return try {
@@ -72,18 +82,11 @@ object SecureStateStore {
                 Log.w(TAG, "Mesh core produced no state to persist.")
                 return false
             }
-            val target = stateFile(context)
-            val temp = File(target.parentFile, "$STATE_FILE.tmp")
-            temp.writeBytes(blob)
-            if (!temp.renameTo(target)) {
-                // renameTo will not overwrite on some filesystems.
-                target.delete()
-                if (!temp.renameTo(target)) {
-                    temp.delete()
-                    Log.e(TAG, "Could not move new secure state into place.")
-                    return false
-                }
+            if (!writeDurably(stateFile(context), blob)) {
+                Log.e(TAG, "Could not move new secure state into place.")
+                return false
             }
+            MeshCoreBridge.commitState()
             true
         } catch (e: Exception) {
             Log.e(TAG, "Could not persist secure state.", e)
@@ -100,10 +103,42 @@ object SecureStateStore {
      * it, any copy of the file that was already taken off the device stays
      * unreadable forever.
      */
+    @Synchronized
     fun wipe(context: Context) {
         stateFile(context).delete()
         File(stateFile(context).parentFile, "$STATE_FILE.tmp").delete()
         KeystoreVault.clear(context, PREFS_NAME, KEY_VAULT_SECRET, KEYSTORE_ALIAS)
+    }
+
+    /**
+     * Replaces [target] with [bytes] so that it survives losing power as well as
+     * the process: the contents are synced before the rename, and the directory
+     * after it. Throws on any failure before the rename, which leaves [target]
+     * as it was. The directory sync is best effort, since not every filesystem
+     * allows it; a process kill does not depend on it.
+     */
+    internal fun writeDurably(target: File, bytes: ByteArray): Boolean {
+        val temp = File(target.parentFile, "${target.name}.tmp")
+        FileOutputStream(temp).use { out ->
+            out.write(bytes)
+            out.fd.sync()
+        }
+        if (!temp.renameTo(target)) {
+            // renameTo will not overwrite on some filesystems.
+            target.delete()
+            if (!temp.renameTo(target)) {
+                temp.delete()
+                return false
+            }
+        }
+        try {
+            FileChannel.open(target.absoluteFile.parentFile.toPath(), StandardOpenOption.READ).use {
+                it.force(true)
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "Could not sync the state directory.", e)
+        }
+        return true
     }
 
     private fun stateFile(context: Context) = File(context.applicationContext.filesDir, STATE_FILE)

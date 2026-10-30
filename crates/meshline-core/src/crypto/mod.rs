@@ -44,6 +44,8 @@ pub enum CryptoError {
     Aead,
     #[error("Session nonce space exhausted; re-handshake required")]
     SessionExhausted,
+    #[error("No durably reserved nonce left; persist the secure state first")]
+    NonceReservationExhausted,
     #[error("No such group on this device")]
     UnknownGroup,
     #[error("Only the group admin may do that")]
