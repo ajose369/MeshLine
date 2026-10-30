@@ -78,7 +78,14 @@ cd android && ./gradlew testDebugUnitTest
 ```
 
 **Verify the JNI symbols survived R8.** A mismatch here fails only at runtime, on
-a user's device, with the app silently refusing to send anything:
+a user's device, with the app silently refusing to send anything. Run the automated
+verification tool across all shipped ABIs:
+
+```bash
+python tools/release/check_jni.py --variant release
+```
+
+Or manually using `llvm-nm`:
 
 ```bash
 NM="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/<host>/bin/llvm-nm"
