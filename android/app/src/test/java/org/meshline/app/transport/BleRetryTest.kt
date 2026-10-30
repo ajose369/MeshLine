@@ -1,6 +1,8 @@
 package org.meshline.app.transport
 
+import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertArrayEquals
@@ -256,5 +258,193 @@ class BleRetryTest {
 
         assertNull("Timeout runnable reference should be cleared", state.timeoutRunnable)
         assertEquals(false, timedOut)
+    }
+
+    private fun createGatt(manager: BleTransportManager): BluetoothGatt {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        org.robolectric.Shadows.shadowOf(app).grantPermissions(
+            android.Manifest.permission.BLUETOOTH_CONNECT
+        )
+        val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val device = btManager.adapter.getRemoteDevice(testAddress)
+        return device.connectGatt(context, false, manager.gattClientCallback)
+    }
+
+    @Test
+    fun `rejected write immediately requeues packet and disconnects`() {
+        val manager = BleTransportManager(context)
+        manager.writeCharacteristicInvoker = { _, _, _ -> false }
+        val gatt = createGatt(manager)
+
+        val p0 = dummyPacket(1, 50)
+        val state = BleTransportManager.WriteQueueState(
+            packets = listOf(p0),
+            frames = listOf(BleTransportManager.Frame(0, p0)),
+            submittedIndex = -1,
+            acknowledgedIndex = -1,
+            characteristic = characteristic
+        )
+
+        manager.writeStates[testAddress] = state
+        manager.sendNextFrame(gatt, state)
+
+        assertNull("State must be removed from writeStates on immediate rejection", manager.writeStates[testAddress])
+        val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
+        assertEquals(1, requeued.size)
+        assertArrayEquals(p0, requeued[0])
+    }
+
+    @Test
+    fun `write deadline expiry requeues packet and disconnects`() {
+        val manager = BleTransportManager(context)
+        manager.writeCharacteristicInvoker = { _, _, _ -> true }
+        val gatt = createGatt(manager)
+
+        val p0 = dummyPacket(2, 60)
+        val state = BleTransportManager.WriteQueueState(
+            packets = listOf(p0),
+            frames = listOf(BleTransportManager.Frame(0, p0)),
+            submittedIndex = -1,
+            acknowledgedIndex = -1,
+            characteristic = characteristic
+        )
+
+        manager.writeStates[testAddress] = state
+        manager.sendNextFrame(gatt, state)
+
+        assertEquals("Frame 0 must be submitted", 0, state.submittedIndex)
+        assertNotNull("Write state should remain pending before timeout", manager.writeStates[testAddress])
+
+        // Advance the looper past the write timeout
+        org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+
+        assertNull("Write state must be cleared after deadline expires", manager.writeStates[testAddress])
+        val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
+        assertEquals(1, requeued.size)
+        assertArrayEquals(p0, requeued[0])
+    }
+
+    @Test
+    fun `success callback advances exactly one frame until queue finishes`() {
+        val manager = BleTransportManager(context)
+        manager.writeCharacteristicInvoker = { _, _, _ -> true }
+        val gatt = createGatt(manager)
+
+        val p0 = dummyPacket(3, 100)
+        val frame0 = dummyPacket(3, 50)
+        val frame1 = dummyPacket(4, 50)
+        val state = BleTransportManager.WriteQueueState(
+            packets = listOf(p0),
+            frames = listOf(
+                BleTransportManager.Frame(0, frame0),
+                BleTransportManager.Frame(0, frame1)
+            ),
+            submittedIndex = -1,
+            acknowledgedIndex = -1,
+            characteristic = characteristic
+        )
+
+        manager.writeStates[testAddress] = state
+        manager.sendNextFrame(gatt, state)
+
+        assertEquals("First frame submitted", 0, state.submittedIndex)
+        assertEquals("No frames acknowledged yet", -1, state.acknowledgedIndex)
+
+        // Frame 0 completes successfully
+        manager.gattClientCallback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_SUCCESS)
+
+        assertEquals("First frame acknowledged", 0, state.acknowledgedIndex)
+        assertEquals("Second frame submitted", 1, state.submittedIndex)
+        assertNotNull("State still active", manager.writeStates[testAddress])
+
+        // Frame 1 completes successfully
+        manager.gattClientCallback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_SUCCESS)
+
+        assertEquals("Second frame acknowledged", 1, state.acknowledgedIndex)
+        assertNull("Queue should be removed upon full completion", manager.writeStates[testAddress])
+
+        val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
+        assertTrue("No packets should be requeued after clean completion", requeued.isEmpty())
+    }
+
+    @Test
+    fun `failure callback requeues packet and disconnects`() {
+        val manager = BleTransportManager(context)
+        manager.writeCharacteristicInvoker = { _, _, _ -> true }
+        val gatt = createGatt(manager)
+
+        val p0 = dummyPacket(5, 50)
+        val state = BleTransportManager.WriteQueueState(
+            packets = listOf(p0),
+            frames = listOf(BleTransportManager.Frame(0, p0)),
+            submittedIndex = -1,
+            acknowledgedIndex = -1,
+            characteristic = characteristic
+        )
+
+        manager.writeStates[testAddress] = state
+        manager.sendNextFrame(gatt, state)
+
+        assertEquals(0, state.submittedIndex)
+
+        // Write callback returns failure
+        manager.gattClientCallback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_FAILURE)
+
+        assertNull("State must be removed after failure", manager.writeStates[testAddress])
+        val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
+        assertEquals(1, requeued.size)
+        assertArrayEquals(p0, requeued[0])
+    }
+
+    @Test
+    fun `service discovery deadline expiry cleans up connectedDevices and closes gatt`() {
+        val manager = BleTransportManager(context)
+        val gatt = createGatt(manager)
+
+        manager.connectedDevices.add(testAddress)
+        manager.scheduleDiscoveryTimeout(gatt, testAddress)
+
+        assertTrue(manager.discoveryTimeouts.containsKey(testAddress))
+        assertTrue(manager.connectedDevices.contains(testAddress))
+
+        // Advance looper past discovery timeout
+        org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+
+        assertTrue("Connected devices must not retain timed out address", !manager.connectedDevices.contains(testAddress))
+        assertTrue("Discovery timeouts map must clear timed out address", !manager.discoveryTimeouts.containsKey(testAddress))
+    }
+
+    @Test
+    fun `service discovery rejection cleans up connectedDevices and disconnects`() {
+        val manager = BleTransportManager(context)
+        val gatt = createGatt(manager)
+
+        manager.connectedDevices.add(testAddress)
+        manager.discoverServicesInvoker = { _ -> false }
+
+        val ok = manager.discoverServicesQuietly(gatt)
+        assertEquals(false, ok)
+        assertTrue("Connected devices must be cleared when discoverServices fails", !manager.connectedDevices.contains(testAddress))
+    }
+
+    @Test
+    fun `stopping transport requeues in-flight write states`() {
+        val manager = BleTransportManager(context)
+        val p0 = dummyPacket(7, 50)
+        val state = BleTransportManager.WriteQueueState(
+            packets = listOf(p0),
+            frames = listOf(BleTransportManager.Frame(0, p0)),
+            submittedIndex = 0,
+            acknowledgedIndex = -1,
+            characteristic = characteristic
+        )
+
+        manager.writeStates[testAddress] = state
+        manager.stopMeshTransport()
+
+        assertTrue("Write states should be empty after stop", manager.writeStates.isEmpty())
+        val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
+        assertEquals(1, requeued.size)
+        assertArrayEquals(p0, requeued[0])
     }
 }
