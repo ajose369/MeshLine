@@ -1,5 +1,6 @@
 package org.meshline.app.transport
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -21,6 +22,8 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.Collections
@@ -57,6 +60,12 @@ class BleTransportManager(private val context: Context) {
          */
         private const val MAX_ATT_PAYLOAD =
             PacketFraming.MAX_MTU - PacketFraming.ATT_WRITE_OVERHEAD
+
+        /** Default deadline for a single GATT write operation to complete. */
+        const val DEFAULT_WRITE_TIMEOUT_MS = 5000L
+
+        /** Default deadline for GATT service discovery to complete. */
+        const val DEFAULT_DISCOVERY_TIMEOUT_MS = 10000L
     }
 
     private val bluetoothManager: BluetoothManager? by lazy {
@@ -68,20 +77,81 @@ class BleTransportManager(private val context: Context) {
     private var bleScanner: BluetoothLeScanner? = null
     private var gattServer: BluetoothGattServer? = null
 
-    private val connectedDevices = Collections.synchronizedSet(mutableSetOf<String>())
-    private val peerCount = AtomicInteger(0)
-
     /** One BLE write, and which packet it belongs to. */
-    private data class Frame(val packetIndex: Int, val bytes: ByteArray)
+    internal data class Frame(val packetIndex: Int, val bytes: ByteArray)
 
-    private data class WriteQueueState(
+    internal data class WriteQueueState(
         val packets: List<ByteArray>,
         val frames: List<Frame>,
-        var index: Int,
-        val characteristic: BluetoothGattCharacteristic
-    )
+        @Volatile var submittedIndex: Int = -1,
+        @Volatile var acknowledgedIndex: Int = -1,
+        val characteristic: BluetoothGattCharacteristic,
+        var timeoutRunnable: Runnable? = null
+    ) {
+        /**
+         * Returns the index of the first packet that was not fully acknowledged.
+         * If the final fragment of a packet failed, the entire packet is uncompleted
+         * and must be requeued.
+         */
+        fun firstUncompletedPacketIndex(): Int {
+            if (frames.isEmpty()) return packets.size
+            if (acknowledgedIndex < 0) return 0
 
-    private val writeStates = ConcurrentHashMap<String, WriteQueueState>()
+            val lastAckedPacket = frames[acknowledgedIndex].packetIndex
+            var lastFrameOfAckedPacket = acknowledgedIndex
+            while (lastFrameOfAckedPacket + 1 < frames.size &&
+                frames[lastFrameOfAckedPacket + 1].packetIndex == lastAckedPacket
+            ) {
+                lastFrameOfAckedPacket++
+            }
+
+            return if (acknowledgedIndex >= lastFrameOfAckedPacket) {
+                lastAckedPacket + 1
+            } else {
+                lastAckedPacket
+            }
+        }
+    }
+
+    internal val connectedDevices = Collections.synchronizedSet(mutableSetOf<String>())
+    internal val peerCount = AtomicInteger(0)
+    internal val writeStates = ConcurrentHashMap<String, WriteQueueState>()
+    internal val discoveryTimeouts = ConcurrentHashMap<String, Runnable>()
+    internal var writeTimeoutMs: Long = DEFAULT_WRITE_TIMEOUT_MS
+    internal var discoveryTimeoutMs: Long = DEFAULT_DISCOVERY_TIMEOUT_MS
+    internal var timeoutHandler: Handler = Handler(Looper.getMainLooper())
+
+    @SuppressLint("MissingPermission")
+    private fun defaultWriteCharacteristic(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray
+    ): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val res = gatt.writeCharacteristic(
+                characteristic,
+                value,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            )
+            res == android.bluetooth.BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            characteristic.value = value
+            @Suppress("DEPRECATION")
+            gatt.writeCharacteristic(characteristic)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun defaultDiscoverServices(gatt: BluetoothGatt): Boolean {
+        return gatt.discoverServices()
+    }
+
+    internal var writeCharacteristicInvoker: (gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) -> Boolean =
+        ::defaultWriteCharacteristic
+
+    internal var discoverServicesInvoker: (gatt: BluetoothGatt) -> Boolean =
+        ::defaultDiscoverServices
 
     /** Negotiated ATT MTU per peer, until one is agreed. */
     private val negotiatedMtu = ConcurrentHashMap<String, Int>()
@@ -164,7 +234,11 @@ class BleTransportManager(private val context: Context) {
             bleAdvertiser = null
             bleScanner = null
             connectedDevices.clear()
+            discoveryTimeouts.values.forEach { timeoutHandler.removeCallbacks(it) }
+            discoveryTimeouts.clear()
+            val inFlight = writeStates.values.toList()
             writeStates.clear()
+            inFlight.forEach { requeueUnsent(it) }
             negotiatedMtu.clear()
             synchronized(reassemblyLock) { reassembler.clear() }
             peerCount.set(0)
@@ -229,7 +303,7 @@ class BleTransportManager(private val context: Context) {
         }
     }
 
-    private val gattClientCallback = object : BluetoothGattCallback() {
+    internal val gattClientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
             gatt ?: return
             val address = try {
@@ -242,6 +316,9 @@ class BleTransportManager(private val context: Context) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     peerCount.incrementAndGet()
                     if (!MeshPermissions.canConnect(context)) return
+
+                    // Schedule discovery deadline
+                    scheduleDiscoveryTimeout(gatt, address)
 
                     // Ask for the largest MTU before anything else. Every packet
                     // this app produces is larger than the 23-byte default, so
@@ -256,11 +333,17 @@ class BleTransportManager(private val context: Context) {
 
                     if (!requested) {
                         Log.w(TAG, "MTU request refused for $address; using the default.")
-                        discoverServicesQuietly(gatt)
+                        val ok = discoverServicesQuietly(gatt)
+                        if (!ok) {
+                            cancelDiscoveryTimeout(address)
+                            connectedDevices.remove(address)
+                            negotiatedMtu.remove(address)
+                        }
                     }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    cancelDiscoveryTimeout(address)
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     connectedDevices.remove(address)
                     negotiatedMtu.remove(address)
@@ -287,12 +370,31 @@ class BleTransportManager(private val context: Context) {
             negotiatedMtu[address] = agreed
             Log.i(TAG, "MTU for $address is $agreed (${PacketFraming.payloadCapacity(agreed)} B per frame).")
 
-            discoverServicesQuietly(gatt)
+            val ok = discoverServicesQuietly(gatt)
+            if (!ok) {
+                cancelDiscoveryTimeout(address)
+                connectedDevices.remove(address)
+                negotiatedMtu.remove(address)
+            }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
             gatt ?: return
+            val address = try {
+                gatt.device?.address
+            } catch (e: SecurityException) {
+                null
+            }
+
+            if (address != null) {
+                cancelDiscoveryTimeout(address)
+            }
+
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                if (address != null) {
+                    connectedDevices.remove(address)
+                    negotiatedMtu.remove(address)
+                }
                 disconnectQuietly(gatt)
                 return
             }
@@ -300,13 +402,16 @@ class BleTransportManager(private val context: Context) {
             val characteristic = gatt.getService(MESHLINE_SERVICE_UUID)
                 ?.getCharacteristic(MESHLINE_CHAR_UUID)
             if (characteristic == null) {
+                if (address != null) {
+                    connectedDevices.remove(address)
+                    negotiatedMtu.remove(address)
+                }
                 disconnectQuietly(gatt)
                 return
             }
 
-            val address = try {
-                gatt.device.address
-            } catch (e: SecurityException) {
+            if (address == null) {
+                disconnectQuietly(gatt)
                 return
             }
 
@@ -335,7 +440,13 @@ class BleTransportManager(private val context: Context) {
                 return
             }
 
-            val state = WriteQueueState(packets, frames, 0, characteristic)
+            val state = WriteQueueState(
+                packets = packets,
+                frames = frames,
+                submittedIndex = -1,
+                acknowledgedIndex = -1,
+                characteristic = characteristic
+            )
             writeStates[address] = state
             sendNextFrame(gatt, state)
         }
@@ -357,12 +468,23 @@ class BleTransportManager(private val context: Context) {
                 return
             }
 
+            cancelTimeout(state)
+
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // Carrying on would send the remaining fragments of a packet
                 // whose earlier fragments never arrived, which can only ever
                 // reassemble into rubbish. Stop and put the rest back.
                 Log.w(TAG, "Write to $address failed with status $status; requeuing the rest.")
                 requeueUnsent(address)
+                disconnectQuietly(gatt)
+                return
+            }
+
+            // Mark the submitted frame as successfully acknowledged
+            state.acknowledgedIndex = state.submittedIndex
+
+            // If this was the last frame of the entire queue, finish and disconnect
+            if (state.acknowledgedIndex >= state.frames.size - 1) {
                 writeStates.remove(address)
                 disconnectQuietly(gatt)
                 return
@@ -376,55 +498,129 @@ class BleTransportManager(private val context: Context) {
      * Returns packets that were drained for a connection but never fully
      * written, so a dropped link delays delivery instead of destroying it.
      */
-    private fun requeueUnsent(address: String) {
+    internal fun requeueUnsent(address: String) {
         val state = writeStates.remove(address) ?: return
-        val firstUnsent = state.frames.getOrNull(state.index)?.packetIndex ?: return
+        requeueUnsent(state)
+    }
+
+    internal fun requeueUnsent(state: WriteQueueState) {
+        cancelTimeout(state)
+        val firstUncompleted = state.firstUncompletedPacketIndex()
         val store = StoreAndForwardManager.getInstance(context)
-        for (i in firstUnsent until state.packets.size) {
+        for (i in firstUncompleted until state.packets.size) {
             store.queueRawPacket(state.packets[i])
         }
     }
 
-    private fun discoverServicesQuietly(gatt: BluetoothGatt) {
-        if (!MeshPermissions.canConnect(context)) return
-        try {
-            gatt.discoverServices()
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Discover permission revoked.", e)
+    private fun scheduleTimeout(gatt: BluetoothGatt, address: String, state: WriteQueueState) {
+        cancelTimeout(state)
+        val runnable = Runnable {
+            Log.w(TAG, "Write operation timed out after ${writeTimeoutMs}ms for $address; requeuing.")
+            requeueUnsent(address)
+            disconnectQuietly(gatt)
+        }
+        state.timeoutRunnable = runnable
+        timeoutHandler.postDelayed(runnable, writeTimeoutMs)
+    }
+
+    private fun cancelTimeout(state: WriteQueueState) {
+        state.timeoutRunnable?.let {
+            timeoutHandler.removeCallbacks(it)
+            state.timeoutRunnable = null
         }
     }
 
-    private fun sendNextFrame(gatt: BluetoothGatt, state: WriteQueueState) {
-        if (!MeshPermissions.canConnect(context)) return
+    internal fun scheduleDiscoveryTimeout(gatt: BluetoothGatt, address: String) {
+        cancelDiscoveryTimeout(address)
+        val runnable = Runnable {
+            Log.w(TAG, "Service discovery timed out after ${discoveryTimeoutMs}ms for $address; disconnecting.")
+            discoveryTimeouts.remove(address)
+            connectedDevices.remove(address)
+            negotiatedMtu.remove(address)
+            disconnectQuietly(gatt)
+            closeQuietly(gatt)
+        }
+        discoveryTimeouts[address] = runnable
+        timeoutHandler.postDelayed(runnable, discoveryTimeoutMs)
+    }
 
-        if (state.index >= state.frames.size) {
-            try {
-                writeStates.remove(gatt.device.address)
-            } catch (e: SecurityException) {
-                // Nothing to clean up if we cannot read the address.
+    internal fun cancelDiscoveryTimeout(address: String) {
+        discoveryTimeouts.remove(address)?.let {
+            timeoutHandler.removeCallbacks(it)
+        }
+    }
+
+    internal fun discoverServicesQuietly(gatt: BluetoothGatt): Boolean {
+        val address = try { gatt.device?.address } catch (e: SecurityException) { null }
+        if (!MeshPermissions.canConnect(context)) {
+            if (address != null) {
+                cancelDiscoveryTimeout(address)
+                connectedDevices.remove(address)
             }
+            disconnectQuietly(gatt)
+            return false
+        }
+        return try {
+            val ok = discoverServicesInvoker(gatt)
+            if (!ok) {
+                Log.w(TAG, "discoverServices() returned false; disconnecting.")
+                if (address != null) {
+                    cancelDiscoveryTimeout(address)
+                    connectedDevices.remove(address)
+                }
+                disconnectQuietly(gatt)
+            }
+            ok
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Discover permission revoked.", e)
+            if (address != null) {
+                cancelDiscoveryTimeout(address)
+                connectedDevices.remove(address)
+            }
+            disconnectQuietly(gatt)
+            false
+        }
+    }
+
+    internal fun sendNextFrame(gatt: BluetoothGatt, state: WriteQueueState) {
+        val address = try {
+            gatt.device?.address ?: "unknown"
+        } catch (e: SecurityException) {
+            "unknown"
+        }
+
+        if (!MeshPermissions.canConnect(context)) {
+            requeueUnsent(address)
             disconnectQuietly(gatt)
             return
         }
 
-        val frame = state.frames[state.index].bytes
-        state.index++
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(
-                    state.characteristic,
-                    frame,
-                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                state.characteristic.value = frame
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(state.characteristic)
+        val nextIndex = state.submittedIndex + 1
+        if (nextIndex >= state.frames.size) {
+            // All frames have been submitted. If all frames have been acknowledged, disconnect.
+            if (state.acknowledgedIndex >= state.frames.size - 1) {
+                writeStates.remove(address)
+                disconnectQuietly(gatt)
             }
+            return
+        }
+
+        val frame = state.frames[nextIndex].bytes
+        state.submittedIndex = nextIndex
+
+        // Schedule operation deadline before writing
+        scheduleTimeout(gatt, address, state)
+
+        val writeInitiated = try {
+            writeCharacteristicInvoker(gatt, state.characteristic, frame)
         } catch (e: SecurityException) {
             Log.w(TAG, "Write permission revoked.", e)
+            false
+        }
+
+        if (!writeInitiated) {
+            Log.w(TAG, "writeCharacteristic() rejected immediately for $address; requeuing.")
+            requeueUnsent(address)
             disconnectQuietly(gatt)
         }
     }
