@@ -89,7 +89,8 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        id: setup-ndk
         with:
           ndk-version: r27b
           link-to-sdk: true
@@ -98,13 +99,20 @@ jobs:
           targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: cargo install --version 4.1.2 --locked cargo-ndk
       - uses: gradle/actions/setup-gradle@v4
       - name: Build assembleDebug with native core
         working-directory: android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
       - name: Verify JNI symbols (RELEASE.md §3)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: python tools/release/check_jni.py --variant debug
+
 

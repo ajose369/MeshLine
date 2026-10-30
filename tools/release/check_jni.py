@@ -29,29 +29,85 @@ DEFAULT_KT_PATH = ROOT / "android/app/src/main/java/org/meshline/app/bridge/Mesh
 DEFAULT_RUST_PATH = ROOT / "crates/meshline-ffi/src/lib.rs"
 DEFAULT_ABIS = ["arm64-v8a", "armeabi-v7a", "x86_64"]
 
-JNI_SYMBOL_PREFIX_RE = re.compile(r"^Java_org_meshline.*?MeshCoreBridge_(\w+)$")
+
+def jni_mangle(identifier: str) -> str:
+    """Mangle an identifier according to JNI 1.1 specification rules."""
+    # Under JNI rules: '_' is replaced by '_1'
+    return identifier.replace("_", "_1")
+
+
+def derive_jni_prefix(kt_path: Path) -> str:
+    """Derive expected JNI symbol prefix from Kotlin package and object/class declarations.
+
+    Example:
+      package org.meshline.app.bridge
+      object MeshCoreBridge
+      -> Java_org_meshline_app_bridge_MeshCoreBridge_
+    """
+    content = kt_path.read_text(encoding="utf-8")
+    pkg_match = re.search(r"^\s*package\s+([\w\.]+)", content, re.MULTILINE)
+    if not pkg_match:
+        raise ValueError(f"No package declaration found in {kt_path}")
+    pkg = pkg_match.group(1).strip()
+
+    class_match = re.search(
+        r"^\s*(?:internal\s+|public\s+)?(?:object|class)\s+(\w+)",
+        content,
+        re.MULTILINE,
+    )
+    if not class_match:
+        raise ValueError(f"No object or class declaration found in {kt_path}")
+    cls = class_match.group(1).strip()
+
+    pkg_parts = [jni_mangle(p) for p in pkg.split(".")]
+    cls_part = jni_mangle(cls)
+    return f"Java_{'_'.join(pkg_parts)}_{cls_part}_"
+
+
+def extract_bridge_method_names(kt_path: Path) -> list[str]:
+    """Extract raw method names declared as `external fun <name>` in Kotlin."""
+    content = kt_path.read_text(encoding="utf-8")
+    methods = re.findall(r"external\s+fun\s+(\w+)", content)
+    return sorted(set(methods))
+
+
+def extract_expected_jni_symbols(kt_path: Path) -> list[str]:
+    """Extract full expected JNI symbols for all `external fun` declared in Kotlin bridge."""
+    prefix = derive_jni_prefix(kt_path)
+    methods = extract_bridge_method_names(kt_path)
+    return sorted(set(f"{prefix}{jni_mangle(m)}" for m in methods))
+
+
+# Alias for backwards compatibility with tests
+extract_bridge_methods = extract_expected_jni_symbols
+
+
+def extract_rust_jni_symbols(rust_path: Path) -> list[str]:
+    """Extract full exported JNI symbols from Rust source."""
+    content = rust_path.read_text(encoding="utf-8")
+    matches = re.findall(r"fn\s+(Java_\w+)", content)
+    return sorted(set(matches))
+
+
+# Alias for backwards compatibility with tests
+extract_rust_jni_methods = extract_rust_jni_symbols
 
 
 def find_llvm_nm(explicit_nm: str | None = None) -> Path | None:
-    """Locate llvm-nm or nm binary if available on system or in Android NDK."""
+    """Locate llvm-nm or nm binary, preferring NDK's llvm-nm over system nm."""
     if explicit_nm:
         p = Path(explicit_nm)
-        if p.is_file():
-            return p
+        if not p.is_file():
+            raise FileNotFoundError(f"Explicit --nm path not found or not a file: {explicit_nm}")
+        return p
 
-    # Check PATH first
-    for candidate in ("llvm-nm", "llvm-nm.exe", "nm", "nm.exe"):
-        which = shutil.which(candidate)
-        if which:
-            return Path(which)
-
-    # Search in ANDROID_NDK_HOME, ANDROID_HOME, or ANDROID_SDK_ROOT
+    # Search in ANDROID_NDK_HOME, ANDROID_NDK_ROOT, ANDROID_HOME, or ANDROID_SDK_ROOT first
     env_dirs = [
         os.environ.get("ANDROID_NDK_HOME"),
+        os.environ.get("ANDROID_NDK_ROOT"),
         os.environ.get("ANDROID_HOME"),
         os.environ.get("ANDROID_SDK_ROOT"),
     ]
-    # Also check local.properties if present
     local_props = ROOT / "android" / "local.properties"
     if local_props.is_file():
         try:
@@ -71,7 +127,6 @@ def find_llvm_nm(explicit_nm: str | None = None) -> Path | None:
         base_path = Path(base)
         if not base_path.is_dir():
             continue
-        # If pointing directly to an NDK or to SDK containing ndk/
         search_roots = [base_path]
         ndk_subdir = base_path / "ndk"
         if ndk_subdir.is_dir():
@@ -84,31 +139,35 @@ def find_llvm_nm(explicit_nm: str | None = None) -> Path | None:
                 if executable:
                     return executable
 
+    # If NDK llvm-nm not found, check PATH
+    for candidate in ("llvm-nm", "llvm-nm.exe", "nm", "nm.exe"):
+        which = shutil.which(candidate)
+        if which:
+            return Path(which)
+
     return None
 
 
 def extract_symbols_with_nm(nm_path: Path, so_path: Path) -> list[str]:
-    """Run `nm -D --defined-only` on the shared object and extract method names."""
+    """Run `nm -D --defined-only` on the shared object and extract all exported Java_* symbols."""
     cmd = [str(nm_path), "-D", "--defined-only", str(so_path)]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    methods = []
+    symbols = []
     for line in result.stdout.splitlines():
         parts = line.strip().split()
         if not parts:
             continue
-        # Symbol is usually the last token on the line
         sym = parts[-1]
-        m = JNI_SYMBOL_PREFIX_RE.match(sym)
-        if m:
-            methods.append(m.group(1))
-    return sorted(set(methods))
+        if sym.startswith("Java_"):
+            symbols.append(sym)
+    return sorted(set(symbols))
 
 
 def extract_symbols_from_elf_bytes(data: bytes) -> list[str]:
     """Parse ELF dynsym/dynstr table directly in pure Python without external dependencies.
-    
+
     Supports 32-bit and 64-bit ELF, both little and big endian.
-    Only extracts defined symbols (st_shndx != 0 / SHN_UNDEF).
+    Only extracts defined symbols (st_shndx != 0 / SHN_UNDEF) that begin with `Java_`.
     """
     if len(data) < 52 or data[:4] != b"\x7fELF":
         raise ValueError("Not a valid ELF binary")
@@ -170,7 +229,7 @@ def extract_symbols_from_elf_bytes(data: bytes) -> list[str]:
 
     sym_entsize = dynsym_sec["entsize"] or (24 if is_64 else 16)
     count = dynsym_sec["size"] // sym_entsize
-    methods = []
+    symbols = []
 
     for i in range(count):
         sym_off = dynsym_sec["offset"] + i * sym_entsize
@@ -197,11 +256,10 @@ def extract_symbols_from_elf_bytes(data: bytes) -> list[str]:
             else:
                 name_bytes = strtab[st_name:]
             sym_name = name_bytes.decode("utf-8", errors="replace")
-            m = JNI_SYMBOL_PREFIX_RE.match(sym_name)
-            if m:
-                methods.append(m.group(1))
+            if sym_name.startswith("Java_"):
+                symbols.append(sym_name)
 
-    return sorted(set(methods))
+    return sorted(set(symbols))
 
 
 def extract_symbols_from_so(so_path: Path, nm_path: Path | None = None) -> list[str]:
@@ -216,41 +274,25 @@ def extract_symbols_from_so(so_path: Path, nm_path: Path | None = None) -> list[
     return extract_symbols_from_elf_bytes(data)
 
 
-def extract_bridge_methods(kt_path: Path) -> list[str]:
-    """Extract method names declared as `external fun <name>` in Kotlin."""
-    content = kt_path.read_text(encoding="utf-8")
-    methods = re.findall(r"external\s+fun\s+(\w+)", content)
-    return sorted(set(methods))
-
-
-def extract_rust_jni_methods(rust_path: Path) -> list[str]:
-    """Extract method names exported as Java_org_meshline_*MeshCoreBridge_<name> in Rust."""
-    content = rust_path.read_text(encoding="utf-8")
-    methods = JNI_SYMBOL_PREFIX_RE.findall(content)
-    # If findall with prefix regex:
-    matches = re.findall(r"Java_org_meshline.*?MeshCoreBridge_(\w+)", content)
-    return sorted(set(matches))
-
-
 def verify_abi_symbols(
     abi: str,
     so_path: Path,
-    expected_methods: list[str],
+    expected_symbols: list[str],
     nm_path: Path | None = None,
 ) -> tuple[bool, str]:
-    """Verify that a specific .so matches the expected Kotlin bridge methods."""
+    """Verify that a specific .so exports exactly the expected JNI symbols."""
     if not so_path.is_file():
         return False, f"Missing native library for ABI '{abi}': {so_path}"
 
-    actual_methods = extract_symbols_from_so(so_path, nm_path)
-    expected_set = set(expected_methods)
-    actual_set = set(actual_methods)
+    actual_symbols = extract_symbols_from_so(so_path, nm_path)
+    expected_set = set(expected_symbols)
+    actual_set = set(actual_symbols)
 
     missing = sorted(expected_set - actual_set)
     extra = sorted(actual_set - expected_set)
 
     if not missing and not extra:
-        return True, f"OK [{abi}]: {len(actual_methods)} symbols verified in {so_path.name}"
+        return True, f"OK [{abi}]: {len(actual_symbols)} symbols verified in {so_path.name}"
 
     lines = [f"FAILED [{abi}]: JNI symbol mismatch in {so_path}"]
     if missing:
@@ -318,25 +360,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: Kotlin bridge file not found: {args.kt}", file=sys.stderr)
         return 1
 
-    expected_methods = extract_bridge_methods(args.kt)
-    if not expected_methods:
+    try:
+        prefix = derive_jni_prefix(args.kt)
+    except Exception as e:
+        print(f"Error deriving JNI prefix from {args.kt}: {e}", file=sys.stderr)
+        return 1
+
+    expected_symbols = extract_expected_jni_symbols(args.kt)
+    if not expected_symbols:
         print(f"Error: No external fun declarations found in {args.kt}", file=sys.stderr)
         return 1
 
-    print(f"Found {len(expected_methods)} external method(s) in {args.kt.name}")
+    print(f"Derived expected JNI prefix: {prefix}")
+    print(f"Found {len(expected_symbols)} external method(s) in {args.kt.name}")
 
     if args.rust and args.rust.is_file():
-        rust_methods = extract_rust_jni_methods(args.rust)
-        rust_missing = set(expected_methods) - set(rust_methods)
-        rust_extra = set(rust_methods) - set(expected_methods)
+        rust_symbols = extract_rust_jni_symbols(args.rust)
+        rust_missing = set(expected_symbols) - set(rust_symbols)
+        rust_extra = set(rust_symbols) - set(expected_symbols)
         if rust_missing or rust_extra:
-            print("Warning: Rust source declarations and Kotlin bridge declarations differ:", file=sys.stderr)
+            print("Error: Rust source exports and Kotlin bridge declarations differ:", file=sys.stderr)
             if rust_missing:
-                print(f"  Missing in Rust: {sorted(rust_missing)}", file=sys.stderr)
+                print(f"  Missing in Rust ({len(rust_missing)}):", file=sys.stderr)
+                for s in sorted(rust_missing):
+                    print(f"    - {s}", file=sys.stderr)
             if rust_extra:
-                print(f"  Extra in Rust: {sorted(rust_extra)}", file=sys.stderr)
+                print(f"  Extra in Rust ({len(rust_extra)}):", file=sys.stderr)
+                for s in sorted(rust_extra):
+                    print(f"    + {s}", file=sys.stderr)
+            return 1
         else:
-            print(f"Rust source exports match Kotlin bridge declarations ({len(rust_methods)} methods)")
+            print(f"Rust source exports match Kotlin bridge declarations ({len(rust_symbols)} symbols)")
 
     nm_path = find_llvm_nm(args.nm)
     if nm_path:
@@ -346,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # If single .so specified
     if args.so:
-        ok, msg = verify_abi_symbols("custom", args.so, expected_methods, nm_path)
+        ok, msg = verify_abi_symbols("custom", args.so, expected_symbols, nm_path)
         print(msg)
         return 0 if ok else 1
 
@@ -379,13 +433,13 @@ def main(argv: list[str] | None = None) -> int:
     all_ok = True
     for abi in abis:
         so_path = jni_dir / abi / "libmeshline_ffi.so"
-        ok, msg = verify_abi_symbols(abi, so_path, expected_methods, nm_path)
+        ok, msg = verify_abi_symbols(abi, so_path, expected_symbols, nm_path)
         print(msg)
         if not ok:
             all_ok = False
 
     if all_ok:
-        print(f"\nSUCCESS: All {len(abis)} ABIs match MeshCoreBridge ({len(expected_methods)} symbols each).")
+        print(f"\nSUCCESS: All {len(abis)} ABIs match {args.kt.name} ({len(expected_symbols)} symbols each).")
         return 0
     else:
         print(f"\nFAILURE: JNI symbol verification failed.", file=sys.stderr)
