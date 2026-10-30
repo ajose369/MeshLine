@@ -39,6 +39,13 @@ object MeshCoreBridge {
         false
     }
 
+    /**
+     * A packet ready to transmit, with the id it carries on the wire. That id is
+     * the one to store in history and the outbox: it is what the recipient's ACK
+     * will name, and an id invented locally could never match one.
+     */
+    class CreatedPacket(val msgIdHex: String, val bytes: ByteArray)
+
     /** True only when the core is loaded and a mesh identity is active. */
     fun isReady(): Boolean = status == Status.READY
 
@@ -153,6 +160,31 @@ object MeshCoreBridge {
     fun createChat(recipientIdHex: String, message: String): ByteArray? =
         guarded { nativeCreateChat(recipientIdHex, message) }
 
+    /** [createSos], with the packet's canonical id. */
+    fun createSosPacket(
+        message: String,
+        latitude: Double?,
+        longitude: Double?,
+        accuracyMeters: Float?,
+    ): CreatedPacket? = withPacketId(createSos(message, latitude, longitude, accuracyMeters))
+
+    /** [createChat], with the packet's canonical id. Null still means "not sent". */
+    fun createChatPacket(recipientIdHex: String, message: String): CreatedPacket? =
+        withPacketId(createChat(recipientIdHex, message))
+
+    /** [createGroupChat], with the packet's canonical id. Null still means "not sent". */
+    fun createGroupChatPacket(groupIdHex: String, message: String): CreatedPacket? =
+        withPacketId(createGroupChat(groupIdHex, message))
+
+    /** The canonical id of a packet this device built. Null if it does not parse. */
+    fun packetId(packet: ByteArray): String? = guarded { nativePacketId(packet) }
+
+    private fun withPacketId(packet: ByteArray?): CreatedPacket? {
+        if (packet == null) return null
+        val id = packetId(packet) ?: return null
+        return CreatedPacket(id, packet)
+    }
+
     fun beginHandshake(peerIdHex: String): ByteArray? =
         guarded { nativeBeginHandshake(peerIdHex) }
 
@@ -236,6 +268,10 @@ object MeshCoreBridge {
      * Verifies and processes an inbound frame, returning a JSON description of
      * what to do next. A null return means the packet failed authentication and
      * must be dropped.
+     *
+     * For an ACK, mark `acked_message_id` delivered, and only when it is present:
+     * the core sets it only for an ACK signed by the node the message was sent
+     * to. `msg_id` is the ACK packet's own id and matches no message.
      */
     fun processIncoming(rawPacket: ByteArray): String? =
         guarded { nativeProcessIncoming(rawPacket) }
@@ -285,6 +321,7 @@ object MeshCoreBridge {
     ): ByteArray?
     private external fun nativeCreateChat(recipientIdHex: String, message: String): ByteArray?
     private external fun nativeBeginHandshake(peerIdHex: String): ByteArray?
+    private external fun nativePacketId(rawPacket: ByteArray): String?
     private external fun nativeHasSession(peerIdHex: String): Boolean
     private external fun nativeProcessIncoming(rawPacket: ByteArray): String?
     private external fun nativeActivePinsJson(): String?
