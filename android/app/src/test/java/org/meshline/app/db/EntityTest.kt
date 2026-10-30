@@ -2,6 +2,7 @@ package org.meshline.app.db
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -69,3 +70,59 @@ class ResourcePinEntityTest {
         assertEquals("abc123", pin(2_000).creatorId)
     }
 }
+
+class PeerNodeEntityTest {
+
+    @Test
+    fun `direct peer with measured RSSI is marked direct and not relayed`() {
+        val peer = PeerNodeEntity(
+            nodeId = "p1",
+            displayName = "Node p1",
+            rssiDbm = -70,
+            lastSeenMillis = 1000L,
+            transport = "Bluetooth LE",
+            reachability = PeerReachability.DIRECT
+        )
+        assertTrue(peer.isDirect)
+        assertEquals(-70, peer.rssiDbm)
+    }
+
+    @Test
+    fun `relayed peer without RSSI is marked relayed and has no direct signal`() {
+        val peer = PeerNodeEntity(
+            nodeId = "p2",
+            displayName = "Node p2",
+            rssiDbm = null,
+            lastSeenMillis = 1000L,
+            transport = "Bluetooth LE",
+            reachability = PeerReachability.RELAYED,
+            hopCount = 3
+        )
+        assertFalse(peer.isDirect)
+        assertNull(peer.rssiDbm)
+        assertEquals(3, peer.hopCount)
+    }
+
+    @Test
+    fun `custody holder flag reflects packets held for mesh`() {
+        val holder = PeerNodeEntity(
+            nodeId = "p3",
+            displayName = "Node p3",
+            lastSeenMillis = 1000L,
+            transport = "Bluetooth LE",
+            custodyPacketsHeld = 2
+        )
+        assertTrue(holder.isCustodyHolder)
+        assertEquals(2, holder.custodyPacketsHeld)
+
+        val nonHolder = PeerNodeEntity(
+            nodeId = "p4",
+            displayName = "Node p4",
+            lastSeenMillis = 1000L,
+            transport = "Bluetooth LE",
+            custodyPacketsHeld = 0
+        )
+        assertFalse(nonHolder.isCustodyHolder)
+    }
+}
+
