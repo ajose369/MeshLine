@@ -1,0 +1,68 @@
+#!/usr/bin/env python
+"""git pre-push hook (installed by tools/agents/setup_clone.py via core.hooksPath).
+
+Blocks, in a lane clone (git config <slug>.lane = A|B, slug from autopilot.toml):
+  - any push to main/master (branch protection may be off; this is the local backstop)
+  - pushes to the other lane's branches
+  - pushed branches whose changed files the lane doesn't own (tools/check_owners.py)
+Clones without the lane key (the user's integration clone) are not restricted.
+"""
+import os
+import subprocess
+import sys
+
+ZERO = "0" * 40
+# This file lives in <runtime>/tools/agents/githooks/; everything it uses is the runtime clone's
+# (main's) copy, whatever branch the lane clone has checked out.
+AGENTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS_DIR = os.path.dirname(AGENTS_DIR)
+sys.path.insert(0, AGENTS_DIR)
+from common import AGENT, LANE_KEY, OTHER  # noqa: E402
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
+
+
+def main():
+    lane = git("config", "--get", LANE_KEY)
+    if lane not in AGENT:
+        return 0
+    me, other = AGENT[lane], AGENT[OTHER[lane]]
+    failed = False
+    for line in sys.stdin.read().splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, _ = parts
+        if not remote_ref.startswith("refs/heads/"):
+            continue  # tags are fine
+        branch = remote_ref[len("refs/heads/"):]
+        if branch in ("main", "master"):
+            print(f"pre-push: refusing to push to {branch}. Open a PR from your own branch.", file=sys.stderr)
+            failed = True
+            continue
+        if branch.startswith((f"{other}/", f"contract/{other}-")):
+            print(f"pre-push: {branch} belongs to {other}; never push to the other lane's branches.", file=sys.stderr)
+            failed = True
+            continue
+        if local_sha == ZERO:
+            continue  # deleting a remote branch
+        if not branch.startswith((f"{me}/", f"contract/{me}-")):
+            print(f"pre-push: branch {branch} must start with {me}/ or contract/{me}-.", file=sys.stderr)
+            failed = True
+            continue
+        base = git("merge-base", "origin/main", local_sha) or "origin/main"
+        files = [f for f in git("diff", "--name-only", f"{base}..{local_sha}").splitlines() if f]
+        if files:
+            r = subprocess.run([sys.executable, os.path.join(TOOLS_DIR, "check_owners.py"),
+                                "--branch", branch, "--files", *files], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            if r.returncode != 0:
+                print("pre-push: " + r.stdout.strip(), file=sys.stderr)
+                failed = True
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -25,3 +25,6 @@ android/keystore.properties
 Thumbs.db
 *.swp
 *.mbtiles
+
+# Python bytecode from tools/
+__pycache__/

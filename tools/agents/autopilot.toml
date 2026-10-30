@@ -1,0 +1,33 @@
+# Autopilot configuration — the ONE place for everything project-specific (AGENTS.md §13).
+# Every other file in tools/agents/ reads these values through common.py; the launcher and the
+# Antigravity hooks/skill are rendered from templates with them by setup_clone.py.
+# CONTRACT FILE (tools/agents/ is unowned, so it is "contract" in OWNERS.toml).
+
+[project]
+name = "MeshLine"                                   # used in prompts, status.md, window titles
+slug = "meshline"                                   # git config key (meshline.lane), review marker, env vars
+repo = "https://github.com/ajose369/MeshLine.git"
+
+[paths]
+# Folder names are relative to `products` (override with the MESHLINE_PRODUCTS env var).
+products = 'C:\THIS PC\Products'
+integration = "MeshLine"                            # the user's own clone; agents never touch it
+state = "MeshLine-agents"                           # heartbeat, STOP, status.md, logs, runtime clone
+clone_a = "MeshLine-claude"                         # Lane A (Claude Code)
+clone_b = "MeshLine-gemini"                         # Lane B (Gemini in Antigravity)
+launcher = "MeshLine-Autopilot.cmd"                 # written into `products` by setup_clone.py --launcher
+
+[checks]
+# What "everything green locally" means (AGENTS.md §4.10). Quoted into every autopilot prompt.
+# Run from the clone root; the Android ones from android/.
+commands = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace",
+  "cargo run -q -p meshline-sim",
+  "cd android && ./gradlew testDebugUnitTest lintDebug -Pmeshline.skipRustBuild=true",
+  "python tools/board.py --validate",
+  "python tools/check_owners.py",
+]
+# Lock files that must never be hand-merged on a rebase: take origin/main's copy, then run this.
+lockfiles = { "Cargo.lock" = "cargo check --workspace" }
