@@ -70,6 +70,7 @@ class BleTransportManager(private val context: Context) {
 
     private val connectedDevices = Collections.synchronizedSet(mutableSetOf<String>())
     private val peerCount = AtomicInteger(0)
+    private val deviceRssi = ConcurrentHashMap<String, Int>()
 
     /** One BLE write, and which packet it belongs to. */
     private data class Frame(val packetIndex: Int, val bytes: ByteArray)
@@ -129,6 +130,7 @@ class BleTransportManager(private val context: Context) {
             startAdvertising()
             startScanning()
             lastError = null
+            StoreAndForwardManager.getInstance(context).setTransportActive(true)
             true
         } catch (e: SecurityException) {
             // Possible if a permission is revoked between the check and the call.
@@ -164,10 +166,12 @@ class BleTransportManager(private val context: Context) {
             bleAdvertiser = null
             bleScanner = null
             connectedDevices.clear()
+            deviceRssi.clear()
             writeStates.clear()
             negotiatedMtu.clear()
             synchronized(reassemblyLock) { reassembler.clear() }
             peerCount.set(0)
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
         }
     }
 
@@ -517,8 +521,13 @@ class BleTransportManager(private val context: Context) {
                 }
 
                 if (packet != null) {
+                    val directRssi = if (deviceKey != "unknown") deviceRssi[deviceKey] else null
                     StoreAndForwardManager.getInstance(context)
-                        .processIncomingPacket(packet, transport = "Bluetooth LE")
+                        .processIncomingPacket(
+                            packet,
+                            transport = "Bluetooth LE",
+                            directLinkRssi = directRssi
+                        )
                 }
             }
 
@@ -563,6 +572,7 @@ class BleTransportManager(private val context: Context) {
             } catch (e: SecurityException) {
                 return
             }
+            result.let { deviceRssi[address] = it.rssi }
             if (connectedDevices.add(address)) {
                 connectToPeer(device)
             }

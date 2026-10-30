@@ -16,11 +16,16 @@ import org.json.JSONObject
 import org.meshline.app.bridge.MeshCoreBridge
 import org.meshline.app.security.SecureStateStore
 
+enum class PeerReachability {
+    DIRECT,
+    RELAYED
+}
+
 /** A peer this device has actually heard from. */
 data class PeerNodeEntity(
     val nodeId: String,
     val displayName: String,
-    val rssiDbm: Int,
+    val rssiDbm: Int? = null,
     val lastSeenMillis: Long,
     val transport: String,
     val hasSecureSession: Boolean = false,
@@ -29,8 +34,14 @@ data class PeerNodeEntity(
      * An encrypted session proves the key is consistent; only this proves the
      * person holding it is who you think.
      */
-    val isVerified: Boolean = false
-)
+    val isVerified: Boolean = false,
+    val reachability: PeerReachability = PeerReachability.RELAYED,
+    val hopCount: Int? = null,
+    val custodyPacketsHeld: Int = 0
+) {
+    val isDirect: Boolean get() = reachability == PeerReachability.DIRECT
+    val isCustodyHolder: Boolean get() = custodyPacketsHeld > 0
+}
 
 /** The outcome of a membership change, for a UI that must not overstate it. */
 data class GroupRekeyReport(
@@ -66,6 +77,13 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
     private val _peersFlow = MutableStateFlow<List<PeerNodeEntity>>(emptyList())
     val peersFlow: StateFlow<List<PeerNodeEntity>> = _peersFlow.asStateFlow()
+
+    private val _transportActiveFlow = MutableStateFlow(false)
+    val transportActiveFlow: StateFlow<Boolean> = _transportActiveFlow.asStateFlow()
+
+    fun setTransportActive(active: Boolean) {
+        _transportActiveFlow.value = active
+    }
 
     private val _groupsFlow = MutableStateFlow<List<GroupEntity>>(emptyList())
     val groupsFlow: StateFlow<List<GroupEntity>> = _groupsFlow.asStateFlow()
@@ -389,7 +407,11 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * result. Frames that fail authentication are dropped silently; they are
      * noise or hostile, and either way nothing about them should reach the UI.
      */
-    fun processIncomingPacket(rawPacket: ByteArray, transport: String = "Bluetooth LE") {
+    fun processIncomingPacket(
+        rawPacket: ByteArray,
+        transport: String = "Bluetooth LE",
+        directLinkRssi: Int? = null
+    ) {
         val json = MeshCoreBridge.processIncoming(rawPacket)
         if (json == null) {
             // Not an error worth surfacing: unverifiable traffic is expected on
@@ -411,7 +433,20 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
             obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
 
-            observePeer(senderId, transport)
+            // DEFAULT_TTL is 8. A 1-hop packet has ttl >= 7 when processed.
+            // Hops > 1 means the packet arrived via intermediate mesh relay(s).
+            val hops = (8 - ttl).coerceAtLeast(1)
+            val isDirect = hops <= 1 && directLinkRssi != null
+            val reachability = if (isDirect) PeerReachability.DIRECT else PeerReachability.RELAYED
+            val rssi = if (isDirect) directLinkRssi else null
+
+            observePeer(
+                nodeId = senderId,
+                transport = transport,
+                rssiDbm = rssi,
+                reachability = reachability,
+                hopCount = hops
+            )
 
             when (packetType) {
                 "PublicSos" -> obj.optStringOrNull("sos_text")?.let { text ->
@@ -550,18 +585,52 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     // -----------------------------------------------------------------------
 
     /** Records that we heard an authenticated packet from this node. */
-    fun observePeer(nodeId: String, transport: String, rssiDbm: Int? = null) {
+    fun observePeer(
+        nodeId: String,
+        transport: String,
+        rssiDbm: Int? = null,
+        reachability: PeerReachability = PeerReachability.RELAYED,
+        hopCount: Int? = null,
+        custodyPacketsHeld: Int = 0
+    ) {
         val existing = peerStore[nodeId]
+        val effectiveReachability = if (reachability == PeerReachability.DIRECT) {
+            PeerReachability.DIRECT
+        } else {
+            existing?.reachability ?: PeerReachability.RELAYED
+        }
+        val effectiveRssi = if (effectiveReachability == PeerReachability.DIRECT) {
+            rssiDbm ?: existing?.rssiDbm
+        } else {
+            null
+        }
+        val effectiveHopCount = if (effectiveReachability == PeerReachability.DIRECT) {
+            1
+        } else {
+            hopCount ?: existing?.hopCount
+        }
+        val effectiveCustody = custodyPacketsHeld.coerceAtLeast(existing?.custodyPacketsHeld ?: 0)
+
         peerStore[nodeId] = PeerNodeEntity(
             nodeId = nodeId,
             displayName = "Node ${nodeId.take(6)}",
-            rssiDbm = rssiDbm ?: existing?.rssiDbm ?: 0,
+            rssiDbm = effectiveRssi,
             lastSeenMillis = System.currentTimeMillis(),
             transport = transport,
             hasSecureSession = MeshCoreBridge.hasSession(nodeId),
-            isVerified = MeshCoreBridge.isPeerVerified(nodeId)
+            isVerified = MeshCoreBridge.isPeerVerified(nodeId),
+            reachability = effectiveReachability,
+            hopCount = effectiveHopCount,
+            custodyPacketsHeld = effectiveCustody
         )
         publishPeers()
+    }
+
+    fun updatePeerCustody(nodeId: String, custodyPacketsHeld: Int) {
+        peerStore[nodeId]?.let {
+            peerStore[nodeId] = it.copy(custodyPacketsHeld = custodyPacketsHeld)
+            publishPeers()
+        }
     }
 
     private fun refreshPeerSessionState(nodeId: String) {
