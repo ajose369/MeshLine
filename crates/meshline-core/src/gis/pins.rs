@@ -96,7 +96,13 @@ impl GisPinStore {
         store.values().cloned().collect()
     }
 
-    pub fn get_nearby_pins(&self, lat: f32, lon: f32, radius_km: f32, current_time: u64) -> Vec<ResourcePin> {
+    pub fn get_nearby_pins(
+        &self,
+        lat: f32,
+        lon: f32,
+        radius_km: f32,
+        current_time: u64,
+    ) -> Vec<ResourcePin> {
         let active = self.get_active_pins(current_time);
         active
             .into_iter()

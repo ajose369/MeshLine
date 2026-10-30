@@ -19,10 +19,18 @@ impl MeshSimulator {
             for c in 0..size {
                 let idx = r * size + c;
                 let mut neighbors = Vec::new();
-                if r > 0 { neighbors.push((r - 1) * size + c); }
-                if r + 1 < size { neighbors.push((r + 1) * size + c); }
-                if c > 0 { neighbors.push(r * size + (c - 1)); }
-                if c + 1 < size { neighbors.push(r * size + (c + 1)); }
+                if r > 0 {
+                    neighbors.push((r - 1) * size + c);
+                }
+                if r + 1 < size {
+                    neighbors.push((r + 1) * size + c);
+                }
+                if c > 0 {
+                    neighbors.push(r * size + (c - 1));
+                }
+                if c + 1 < size {
+                    neighbors.push(r * size + (c + 1));
+                }
                 adjacency.insert(idx, neighbors);
             }
         }
@@ -41,16 +49,24 @@ impl MeshSimulator {
         // Cluster A (nodes 0..cluster_size-1)
         for i in 0..cluster_size {
             let mut neighbors = Vec::new();
-            if i > 0 { neighbors.push(i - 1); }
-            if i + 1 < cluster_size { neighbors.push(i + 1); }
+            if i > 0 {
+                neighbors.push(i - 1);
+            }
+            if i + 1 < cluster_size {
+                neighbors.push(i + 1);
+            }
             adjacency.insert(i, neighbors);
         }
 
         // Cluster B (nodes cluster_size..count-1)
         for i in cluster_size..count {
             let mut neighbors = Vec::new();
-            if i > cluster_size { neighbors.push(i - 1); }
-            if i + 1 < count { neighbors.push(i + 1); }
+            if i > cluster_size {
+                neighbors.push(i - 1);
+            }
+            if i + 1 < count {
+                neighbors.push(i + 1);
+            }
             adjacency.insert(i, neighbors);
         }
 
@@ -168,7 +184,11 @@ fn main() {
     let grid_net = MeshSimulator::new_grid(7);
     let (reached_1, tx_1) = grid_net.run_sos_simulation(24, "SOS! Earth tremor sector 4");
     println!("Total Grid Nodes: 49");
-    println!("Nodes Reached: {} / 49 ({:.1}%)", reached_1, (reached_1 as f32 / 49.0) * 100.0);
+    println!(
+        "Nodes Reached: {} / 49 ({:.1}%)",
+        reached_1,
+        (reached_1 as f32 / 49.0) * 100.0
+    );
     println!("Total Packet Transmissions: {}", tx_1);
 
     // Scenario 2: LoRa Hardware Bridge across Partitioned Clusters.
@@ -180,8 +200,7 @@ fn main() {
     const CLUSTER: usize = 4;
     let total_2 = CLUSTER * 2;
     println!("\n--- SCENARIO 2: LoRa Hardware Bridge (5km Multi-Cluster Relay) ---");
-    let (lora_net, bridge_a, bridge_b) =
-        MeshSimulator::new_partitioned_with_lora_bridge(CLUSTER);
+    let (lora_net, bridge_a, bridge_b) = MeshSimulator::new_partitioned_with_lora_bridge(CLUSTER);
     println!(
         "Cluster A (Nodes 0..{}) <--- LoRa 915MHz Bridge (Node {} <-> Node {}) ---> Cluster B (Nodes {}..{})",
         CLUSTER - 1,
@@ -199,7 +218,10 @@ fn main() {
         total_2,
         (reached_2 as f32 / total_2 as f32) * 100.0
     );
-    println!("Total Transmissions (Including LoRa Frame Bridge): {}", tx_2);
+    println!(
+        "Total Transmissions (Including LoRa Frame Bridge): {}",
+        tx_2
+    );
     println!(
         "Note: TTL {} caps a line topology at ~{} hops from the origin.",
         meshline_core::DEFAULT_TTL,
@@ -211,7 +233,11 @@ fn main() {
     let mut low_power_net = MeshSimulator::new_grid(7);
     low_power_net.set_battery_state_all(BatteryPowerState::LowPowerSaver);
     let (reached_3, tx_3) = low_power_net.run_sos_simulation(24, "SOS! Battery saver active");
-    println!("Nodes Reached: {} / 49 ({:.1}%)", reached_3, (reached_3 as f32 / 49.0) * 100.0);
+    println!(
+        "Nodes Reached: {} / 49 ({:.1}%)",
+        reached_3,
+        (reached_3 as f32 / 49.0) * 100.0
+    );
     println!("Total Packet Transmissions: {}", tx_3);
 
     // Scenario 4: forged traffic must not propagate at all.

@@ -378,11 +378,7 @@ impl SessionManager {
             .encrypt(plaintext)
     }
 
-    pub fn decrypt_from(
-        &mut self,
-        peer: &[u8; 16],
-        framed: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt_from(&mut self, peer: &[u8; 16], framed: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.established
             .get_mut(peer)
             .ok_or(CryptoError::NoSession)?
@@ -463,7 +459,9 @@ mod tests {
         assert!(alice.has_session(&bob_id));
         assert!(bob.has_session(&alice_id));
 
-        let ct = alice.encrypt_for(&bob_id, b"meet at the school gate").unwrap();
+        let ct = alice
+            .encrypt_for(&bob_id, b"meet at the school gate")
+            .unwrap();
         let pt = bob.decrypt_from(&alice_id, &ct).unwrap();
         assert_eq!(pt, b"meet at the school gate");
 
@@ -558,7 +556,10 @@ mod tests {
         // under Alice's real, cryptographically verified node id.
         let lie = [0xEE; 16];
         let msg1 = alice.begin_handshake(bob_id, &a_key, NOW).unwrap();
-        let msg2 = bob.accept_handshake(lie, &msg1, &b_key, NOW).unwrap().unwrap();
+        let msg2 = bob
+            .accept_handshake(lie, &msg1, &b_key, NOW)
+            .unwrap()
+            .unwrap();
         let msg3 = alice
             .accept_handshake(bob_id, &msg2, &a_key, NOW)
             .unwrap()
@@ -610,7 +611,9 @@ mod tests {
             let attacker = keypair();
             let mut attacker_mgr = SessionManager::new();
             let peer = node_id_from_pubkey(&attacker.verifying_key().to_bytes());
-            let msg1 = attacker_mgr.begin_handshake([i as u8; 16], &attacker, NOW).unwrap();
+            let msg1 = attacker_mgr
+                .begin_handshake([i as u8; 16], &attacker, NOW)
+                .unwrap();
             let _ = bob.accept_handshake(peer, &msg1, &bob_key, NOW);
         }
         assert!(bob.pending.len() <= MAX_PENDING_HANDSHAKES);
@@ -624,7 +627,9 @@ mod tests {
         let mut bob = SessionManager::new();
 
         let peer = node_id_from_pubkey(&attacker.verifying_key().to_bytes());
-        let msg1 = attacker_mgr.begin_handshake([1u8; 16], &attacker, NOW).unwrap();
+        let msg1 = attacker_mgr
+            .begin_handshake([1u8; 16], &attacker, NOW)
+            .unwrap();
         bob.accept_handshake(peer, &msg1, &bob_key, NOW).unwrap();
         assert_eq!(bob.pending.len(), 1);
 
@@ -632,7 +637,9 @@ mod tests {
         let other = keypair();
         let mut other_mgr = SessionManager::new();
         let other_peer = node_id_from_pubkey(&other.verifying_key().to_bytes());
-        let msg1 = other_mgr.begin_handshake([2u8; 16], &other, NOW + 3600).unwrap();
+        let msg1 = other_mgr
+            .begin_handshake([2u8; 16], &other, NOW + 3600)
+            .unwrap();
         bob.accept_handshake(other_peer, &msg1, &bob_key, NOW + 3600)
             .unwrap();
 

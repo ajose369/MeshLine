@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraFrameHeader {
-    pub frequency_mhz: u16,  // e.g., 915, 868, 433
+    pub frequency_mhz: u16,   // e.g., 915, 868, 433
     pub spreading_factor: u8, // e.g., SF7 to SF12
     pub bandwidth_khz: u16,   // e.g., 125, 250, 500
-    pub coding_rate: u8,     // e.g., 4/5, 4/8
+    pub coding_rate: u8,      // e.g., 4/5, 4/8
     pub rssi: i16,
     pub snr: i8,
 }

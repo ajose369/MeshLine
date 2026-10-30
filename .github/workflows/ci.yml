@@ -53,8 +53,6 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        # Non-blocking until A-001 formats the imported code; A-001 removes this line.
-        continue-on-error: true
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

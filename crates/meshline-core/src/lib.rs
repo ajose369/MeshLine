@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod crypto;
 pub mod gis;
 pub mod packet;
@@ -585,11 +587,7 @@ impl MeshNode {
     ///
     /// A blob that will not open is treated as absent, not as a reason to run
     /// with half a session table: the caller starts fresh and re-handshakes.
-    pub fn import_secure_state(
-        &self,
-        vault_key: &[u8; 32],
-        blob: &[u8],
-    ) -> Result<(), MeshError> {
+    pub fn import_secure_state(&self, vault_key: &[u8; 32], blob: &[u8]) -> Result<(), MeshError> {
         let plaintext = crypto::vault::open(vault_key, blob)?;
         let state: SecureStateIn = bincode::deserialize(&plaintext)
             .map_err(|e| MeshError::Serialization(e.to_string()))?;
@@ -671,8 +669,7 @@ impl MeshNode {
                     // session manager re-keys on the identity proven inside the
                     // handshake itself.
                     let reply_bytes = {
-                        let mut sessions =
-                            self.sessions.lock().expect("session mutex poisoned");
+                        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
                         let reply = sessions
                             .accept_handshake(
                                 packet.header.sender_id,
@@ -685,9 +682,7 @@ impl MeshNode {
 
                         // Once a session exists, remember the identity behind it
                         // so the user can be offered a safety number to compare.
-                        if let Some(key) =
-                            sessions.peer_identity_pubkey(&packet.header.sender_id)
-                        {
+                        if let Some(key) = sessions.peer_identity_pubkey(&packet.header.sender_id) {
                             self.trust
                                 .lock()
                                 .expect("trust mutex poisoned")
@@ -720,8 +715,7 @@ impl MeshNode {
                     // sender that the group store checks against is the one the
                     // packet signature already proved.
                     let invite_bytes = {
-                        let mut sessions =
-                            self.sessions.lock().expect("session mutex poisoned");
+                        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
                         sessions
                             .decrypt_from(&packet.header.sender_id, &packet.payload)
                             .ok()
@@ -802,7 +796,6 @@ impl MeshNode {
             original.header.msg_id.to_vec(),
         )
     }
-
 }
 
 impl Default for MeshNode {
@@ -848,7 +841,9 @@ mod tests {
     fn accepts_a_genuine_sos() {
         let sender = MeshNode::new();
         let receiver = MeshNode::new();
-        let sos = sender.create_public_sos("trapped, third floor", at(12.9, 77.5)).unwrap();
+        let sos = sender
+            .create_public_sos("trapped, third floor", at(12.9, 77.5))
+            .unwrap();
 
         let outcome = receiver.process_incoming(&wire(&sos)).unwrap();
         assert!(outcome.should_relay);
@@ -1034,7 +1029,9 @@ mod tests {
         assert!(alice.has_session_with(&bob.node_id));
         assert!(bob.has_session_with(&alice.node_id));
 
-        let chat = alice.create_chat_packet(bob.node_id, "are you safe?").unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "are you safe?")
+            .unwrap();
 
         // The message must not be readable on the wire.
         let on_wire = wire(&chat);
@@ -1043,10 +1040,7 @@ mod tests {
             .any(|w| w == b"are you safe?"));
 
         let received = bob.process_incoming(&on_wire).unwrap();
-        assert_eq!(
-            received.plaintext.as_deref(),
-            Some(&b"are you safe?"[..])
-        );
+        assert_eq!(received.plaintext.as_deref(), Some(&b"are you safe?"[..]));
         assert!(received.ack.is_some());
     }
 
@@ -1065,10 +1059,15 @@ mod tests {
 
         handshake(&alice, &bob);
 
-        let chat = alice.create_chat_packet(bob.node_id, "meet at gate 4").unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "meet at gate 4")
+            .unwrap();
         let relayed = nosy_relay.process_incoming(&wire(&chat)).unwrap();
 
-        assert!(relayed.plaintext.is_none(), "relay must not recover plaintext");
+        assert!(
+            relayed.plaintext.is_none(),
+            "relay must not recover plaintext"
+        );
         assert!(relayed.should_relay, "but it must still forward the packet");
     }
 
@@ -1093,8 +1092,15 @@ mod tests {
         ));
 
         // The victim's own traffic must be unaffected.
-        let genuine = victim_identity.create_public_sos("real", at(1.0, 1.0)).unwrap();
-        assert!(receiver.process_incoming(&wire(&genuine)).unwrap().should_relay);
+        let genuine = victim_identity
+            .create_public_sos("real", at(1.0, 1.0))
+            .unwrap();
+        assert!(
+            receiver
+                .process_incoming(&wire(&genuine))
+                .unwrap()
+                .should_relay
+        );
     }
 
     #[test]
@@ -1194,11 +1200,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Alice creates a group and brings Bob and Carol in over real packets.
-    fn affinity_group(
-        alice: &MeshNode,
-        bob: &MeshNode,
-        carol: &MeshNode,
-    ) -> [u8; 16] {
+    fn affinity_group(alice: &MeshNode, bob: &MeshNode, carol: &MeshNode) -> [u8; 16] {
         handshake(alice, bob);
         handshake(alice, carol);
 
@@ -1250,10 +1252,15 @@ mod tests {
             .routing
             .set_battery_state(BatteryPowerState::Charging);
 
-        let packet = alice.create_group_chat_packet(&gid, "medic needed").unwrap();
+        let packet = alice
+            .create_group_chat_packet(&gid, "medic needed")
+            .unwrap();
         let relayed = outsider.process_incoming(&wire(&packet)).unwrap();
 
-        assert!(relayed.plaintext.is_none(), "an outsider must learn nothing");
+        assert!(
+            relayed.plaintext.is_none(),
+            "an outsider must learn nothing"
+        );
         assert!(relayed.group_id.is_none());
         assert!(
             relayed.should_relay,
@@ -1285,7 +1292,13 @@ mod tests {
             Err(MeshError::NoSession)
         ));
         assert_eq!(
-            alice.groups.lock().unwrap().get(&gid).unwrap().member_count(),
+            alice
+                .groups
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .unwrap()
+                .member_count(),
             1,
             "a failed invite must not leave a member holding no key"
         );
@@ -1344,7 +1357,11 @@ mod tests {
             Some(&b"new meeting point is the library"[..])
         );
         assert!(
-            carol.process_incoming(&on_wire).unwrap().plaintext.is_none(),
+            carol
+                .process_incoming(&on_wire)
+                .unwrap()
+                .plaintext
+                .is_none(),
             "a removed member must not be able to read the new epoch"
         );
     }
@@ -1402,8 +1419,14 @@ mod tests {
         let gid = affinity_group(&alice, &bob, &carol);
 
         assert!(bob.leave_group(&gid));
-        let packet = alice.create_group_chat_packet(&gid, "still talking").unwrap();
-        assert!(bob.process_incoming(&wire(&packet)).unwrap().plaintext.is_none());
+        let packet = alice
+            .create_group_chat_packet(&gid, "still talking")
+            .unwrap();
+        assert!(bob
+            .process_incoming(&wire(&packet))
+            .unwrap()
+            .plaintext
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1428,7 +1451,9 @@ mod tests {
         let bob_after_restart = restart(&bob, &[42u8; 32]);
 
         assert!(bob_after_restart.has_session_with(&alice.node_id));
-        let chat = alice.create_chat_packet(bob.node_id, "are you safe?").unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "are you safe?")
+            .unwrap();
         assert_eq!(
             bob_after_restart
                 .process_incoming(&wire(&chat))
@@ -1467,7 +1492,9 @@ mod tests {
         let bob = MeshNode::new();
         handshake(&alice, &bob);
 
-        let chat = alice.create_chat_packet(bob.node_id, "one time only").unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "one time only")
+            .unwrap();
         bob.process_incoming(&wire(&chat)).unwrap();
 
         // The replay window is part of the sealed state, so a captured packet
@@ -1488,7 +1515,10 @@ mod tests {
         let gid = bob.create_group("affinity").unwrap();
 
         let blob = bob.export_secure_state(&[3u8; 32]).unwrap();
-        assert!(!blob.windows(16).any(|w| w == gid), "no group id in the clear");
+        assert!(
+            !blob.windows(16).any(|w| w == gid),
+            "no group id in the clear"
+        );
         assert!(
             !blob.windows(16).any(|w| w == alice.node_id),
             "no peer ids in the clear"
@@ -1526,10 +1556,18 @@ mod tests {
         assert!(!bob.is_peer_verified(&alice.node_id));
         assert!(bob.groups.lock().unwrap().is_empty());
 
-        let chat = alice.create_chat_packet(bob.node_id, "after the wipe").unwrap();
-        assert!(bob.process_incoming(&wire(&chat)).unwrap().plaintext.is_none());
+        let chat = alice
+            .create_chat_packet(bob.node_id, "after the wipe")
+            .unwrap();
+        assert!(bob
+            .process_incoming(&wire(&chat))
+            .unwrap()
+            .plaintext
+            .is_none());
 
-        let group_msg = alice.create_group_chat_packet(&gid, "after the wipe").unwrap();
+        let group_msg = alice
+            .create_group_chat_packet(&gid, "after the wipe")
+            .unwrap();
         assert!(bob
             .process_incoming(&wire(&group_msg))
             .unwrap()
@@ -1547,9 +1585,14 @@ mod tests {
         // The mesh identity is untouched by a wipe, so recovery is a fresh
         // handshake rather than a new identity nobody recognises.
         handshake(&alice, &bob);
-        let chat = alice.create_chat_packet(bob.node_id, "back online").unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "back online")
+            .unwrap();
         assert_eq!(
-            bob.process_incoming(&wire(&chat)).unwrap().plaintext.as_deref(),
+            bob.process_incoming(&wire(&chat))
+                .unwrap()
+                .plaintext
+                .as_deref(),
             Some(&b"back online"[..])
         );
     }
