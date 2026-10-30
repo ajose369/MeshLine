@@ -219,10 +219,52 @@ object MeshCoreBridge {
     fun createGroup(name: String): String? = guarded { nativeCreateGroup(name) }
 
     /**
+     * Adds a peer to a group under a new key and epoch, so every member hears about
+     * them and they get no key to earlier traffic. Returns JSON:
+     * `{"invite_packets_hex": [...], "unreachable": [...]}`. Queue every packet.
+     * That only means "queued"; [groupEpochStatusJson] says who confirmed.
+     * A peer who is already a member just gets the current epoch again.
+     * Null means nothing changed: not the admin, or no session with the peer.
+     */
+    fun addToGroup(groupIdHex: String, peerIdHex: String): String? =
+        guarded { nativeAddToGroup(groupIdHex, peerIdHex) }
+
+    /**
+     * Rebuilds the current epoch's invite for every member who has not confirmed it,
+     * for after a lost packet or a new session. Same JSON as [addToGroup]. The
+     * caller decides when to retry; nothing is sent unless these packets are queued.
+     */
+    fun resendGroupUpdates(groupIdHex: String): String? =
+        guarded { nativeResendGroupUpdates(groupIdHex) }
+
+    /**
+     * Admin only; null otherwise. Each other member's standing on the current epoch:
+     * `{"group_id", "epoch", "members": [{"member_id", "acked_epoch", "state"}]}`,
+     * where `state` is `Acknowledged`, `Queued` (built, nothing heard back) or
+     * `NotSent` (no packet for this epoch, usually no session). Only `Acknowledged`
+     * means the member says they hold the key. Receive results carry
+     * `group_epoch_ack` when this may have changed.
+     */
+    fun groupEpochStatusJson(groupIdHex: String): String? =
+        guarded { nativeGroupEpochStatusJson(groupIdHex) }
+
+    /**
+     * Removes a member and rotates the group key: the recovery for a seized or
+     * compromised device. The removed member is sent nothing. Same JSON as
+     * [addToGroup], with one invite per remaining member.
+     */
+    fun removeAndRotate(groupIdHex: String, peerIdHex: String): String? =
+        guarded { nativeRemoveFromGroup(groupIdHex, peerIdHex) }
+
+    /**
      * Adds a peer to a group, returning the invite packet to send. Null means
      * the invite was not created — most often because there is no pairwise
      * session with that peer yet, which is a precondition rather than a bug.
      */
+    @Deprecated(
+        "Existing members never hear about this add and reject the new member's messages.",
+        ReplaceWith("addToGroup(groupIdHex, peerIdHex)")
+    )
     fun inviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray? =
         guarded { nativeInviteToGroup(groupIdHex, peerIdHex) }
 
@@ -240,7 +282,10 @@ object MeshCoreBridge {
     fun removeFromGroup(groupIdHex: String, peerIdHex: String): String? =
         guarded { nativeRemoveFromGroup(groupIdHex, peerIdHex) }
 
-    /** Rotates a group key without changing membership. */
+    /**
+     * Rotates a group key without changing membership. Every listed member gets the
+     * new key, including a seized phone; for that, use [removeAndRotate].
+     */
     fun rekeyGroup(groupIdHex: String): String? = guarded { nativeRekeyGroup(groupIdHex) }
 
     fun leaveGroup(groupIdHex: String): Boolean =
@@ -330,6 +375,9 @@ object MeshCoreBridge {
     private external fun nativeSetPeerVerified(peerIdHex: String, verified: Boolean): Boolean
     private external fun nativeIsPeerVerified(peerIdHex: String): Boolean
     private external fun nativeCreateGroup(name: String): String?
+    private external fun nativeAddToGroup(groupIdHex: String, peerIdHex: String): String?
+    private external fun nativeResendGroupUpdates(groupIdHex: String): String?
+    private external fun nativeGroupEpochStatusJson(groupIdHex: String): String?
     private external fun nativeInviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray?
     private external fun nativeCreateGroupChat(groupIdHex: String, message: String): ByteArray?
     private external fun nativeRemoveFromGroup(groupIdHex: String, peerIdHex: String): String?

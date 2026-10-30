@@ -24,10 +24,12 @@
 //! # Forward secrecy
 //!
 //! Pairwise sessions ratchet; a group key does not. A member's device that is
-//! seized reveals the group traffic it could already read. [`GroupStore::rekey`]
-//! is the answer: it mints a fresh key and epoch and redistributes it to the
-//! remaining members, so a removed or compromised member is locked out of
-//! everything sent afterwards.
+//! seized reveals the group traffic it could already read. Rotation limits that
+//! in both directions: [`GroupStore::add_member_and_rekey`] means a new member
+//! gets no key to anything recorded earlier, and [`GroupStore::remove_member`]
+//! means a removed or compromised member is locked out of everything sent
+//! afterwards. [`GroupStore::rekey`] alone excludes nobody, because the new key
+//! goes to every listed member, including a seized phone that is still listed.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -407,8 +409,12 @@ impl GroupStore {
         Ok(group_id)
     }
 
-    /// Adds a member. Admin only; the caller is responsible for then sending
-    /// that member an invite over a pairwise session.
+    /// Adds a member to the list without changing the epoch.
+    ///
+    /// Only the deprecated single-invite path uses this. Existing members refuse
+    /// a same-epoch update as stale, so their lists stay behind and they reject
+    /// the new member's messages. New code wants
+    /// [`add_member_and_rekey`](Self::add_member_and_rekey).
     pub fn add_member(
         &mut self,
         group_id: &[u8; 16],
@@ -427,6 +433,33 @@ impl GroupStore {
         }
         group.members.push(new_member);
         Ok(())
+    }
+
+    /// Adds a member under a new key and epoch, so every member can be told about
+    /// them and they get no key to earlier traffic. Returns everyone who needs the
+    /// new epoch, the new member included.
+    pub fn add_member_and_rekey(
+        &mut self,
+        group_id: &[u8; 16],
+        actor: &[u8; 16],
+        new_member: [u8; 16],
+    ) -> Result<Vec<[u8; 16]>, CryptoError> {
+        let group = self.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+        if !group.is_admin(actor) {
+            return Err(CryptoError::NotGroupAdmin);
+        }
+        if group.members.len() >= MAX_GROUP_MEMBERS {
+            return Err(CryptoError::GroupFull);
+        }
+        // Rekey first: it is the step that can still fail, and a failure must not
+        // leave a listed member who holds no key.
+        let mut recipients = self.rekey(group_id, actor)?;
+        self.get_mut(group_id)
+            .ok_or(CryptoError::UnknownGroup)?
+            .members
+            .push(new_member);
+        recipients.push(new_member);
+        Ok(recipients)
     }
 
     /// Removes a member and rekeys, so everything sent from now on is out of
@@ -452,9 +485,9 @@ impl GroupStore {
 
     /// Mints a fresh key and epoch. Returns the members to redistribute to.
     ///
-    /// Rekeying is the only thing that actually excludes someone who already
-    /// holds the key, so removals and suspected device compromise both route
-    /// through here.
+    /// Rekeying is the only thing that excludes someone who already holds the key,
+    /// but only once they are off the list. The new key goes to every listed
+    /// member, so a compromised device has to be removed, not just rekeyed around.
     pub fn rekey(
         &mut self,
         group_id: &[u8; 16],
@@ -852,6 +885,61 @@ mod tests {
                 .unwrap(),
             b"persisted"
         );
+    }
+
+    #[test]
+    fn adding_a_member_moves_the_group_to_a_new_key_and_epoch() {
+        let (mut alice, _b, _c, gid) = three_person_group();
+        let before = alice.get(&gid).unwrap().tag();
+        let epoch = alice.get(&gid).unwrap().epoch;
+
+        let recipients = alice.add_member_and_rekey(&gid, &ALICE, MALLORY).unwrap();
+
+        assert_eq!(recipients, vec![BOB, CAROL, MALLORY]);
+        let group = alice.get(&gid).unwrap();
+        assert_eq!(group.epoch, epoch + 1);
+        assert_ne!(group.tag(), before);
+        assert!(group.is_member(&MALLORY));
+    }
+
+    #[test]
+    fn only_the_admin_can_add_with_a_rekey_and_a_refusal_changes_nothing() {
+        let (_a, mut bob, _c, gid) = three_person_group();
+        let tag = bob.get(&gid).unwrap().tag();
+        assert!(matches!(
+            bob.add_member_and_rekey(&gid, &BOB, MALLORY),
+            Err(CryptoError::NotGroupAdmin)
+        ));
+        assert_eq!(bob.get(&gid).unwrap().tag(), tag);
+        assert!(!bob.get(&gid).unwrap().is_member(&MALLORY));
+    }
+
+    #[test]
+    fn a_full_group_refuses_an_add_without_rotating() {
+        let mut alice = GroupStore::new();
+        let gid = alice.create(ALICE, "big", 1000).unwrap();
+        for i in 0..(MAX_GROUP_MEMBERS - 1) {
+            alice.add_member(&gid, &ALICE, [i as u8; 16]).unwrap();
+        }
+        assert!(matches!(
+            alice.add_member_and_rekey(&gid, &ALICE, MALLORY),
+            Err(CryptoError::GroupFull)
+        ));
+        assert_eq!(alice.get(&gid).unwrap().epoch, 0);
+    }
+
+    #[test]
+    fn a_member_who_missed_an_epoch_catches_up_from_the_next() {
+        let (mut alice, mut bob, _c, gid) = three_person_group();
+        alice.add_member_and_rekey(&gid, &ALICE, MALLORY).unwrap();
+        alice.remove_member(&gid, &ALICE, &CAROL).unwrap();
+
+        let latest = alice.get(&gid).unwrap().to_invite();
+        assert_eq!(
+            bob.apply_invite(&ALICE, &BOB, &latest).unwrap(),
+            InviteOutcome::Rekeyed
+        );
+        assert_eq!(bob.get(&gid).unwrap().members, vec![ALICE, BOB, MALLORY]);
     }
 
     #[test]

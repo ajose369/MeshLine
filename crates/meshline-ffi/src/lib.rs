@@ -17,8 +17,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use meshline_core::{
-    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag, MeshNode,
-    Packet, PacketType, ResourcePinType,
+    node_id_from_pubkey, BatteryPowerState, GroupEpochStatus, GroupRekeyResult, InviteOutcome,
+    LocationTag, MemberEpochState, MeshNode, Packet, PacketType, ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -488,6 +488,55 @@ struct RekeyJson {
     unreachable: Vec<String>,
 }
 
+/// A member's confirmation of an epoch. Unlike `invite_packets_hex`, this is
+/// evidence the member holds the key.
+#[derive(Serialize)]
+struct GroupEpochAckJson {
+    group_id: String,
+    member_id: String,
+    epoch: u32,
+}
+
+/// One member's standing on the current epoch.
+#[derive(Serialize)]
+struct MemberEpochJson {
+    member_id: String,
+    acked_epoch: Option<u32>,
+    /// "Acknowledged", "Queued" (built, nothing heard back), or "NotSent".
+    state: &'static str,
+}
+
+#[derive(Serialize)]
+struct GroupEpochStatusJson {
+    group_id: String,
+    epoch: u32,
+    members: Vec<MemberEpochJson>,
+}
+
+fn member_epoch_state_name(state: MemberEpochState) -> &'static str {
+    match state {
+        MemberEpochState::Acknowledged => "Acknowledged",
+        MemberEpochState::Queued => "Queued",
+        MemberEpochState::NotSent => "NotSent",
+    }
+}
+
+fn group_epoch_status_json(status: &GroupEpochStatus) -> GroupEpochStatusJson {
+    GroupEpochStatusJson {
+        group_id: to_hex(&status.group_id),
+        epoch: status.epoch,
+        members: status
+            .members
+            .iter()
+            .map(|m| MemberEpochJson {
+                member_id: to_hex(&m.member),
+                acked_epoch: m.acked_epoch,
+                state: member_epoch_state_name(m.state),
+            })
+            .collect(),
+    }
+}
+
 fn rekey_json(result: &GroupRekeyResult) -> RekeyJson {
     RekeyJson {
         invite_packets_hex: result
@@ -521,8 +570,96 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCreateG
     })
 }
 
-/// Adds a peer to a group, returning the invite packet to transmit. Null when
-/// this device is not the group's admin or has no session with the peer.
+/// Adds a peer under a new key and epoch. Returns the invites for every member,
+/// old and new, and the members that could not be reached. Null when this device
+/// is not the group's admin or has no session with the peer, in which case nothing
+/// changed.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeAddToGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    peer_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(p) => p,
+            None => return std::ptr::null_mut(),
+        };
+
+        let result = with_node!(std::ptr::null_mut(), |node| node.add_to_group(&group, peer));
+
+        match result {
+            Ok(r) => json_out(&mut env, &rekey_json(&r)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Builds the current epoch's invite again for every member who has not confirmed
+/// it. Same result shape as a rekey.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeResendGroupUpdates(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let result = with_node!(std::ptr::null_mut(), |node| node
+            .resend_group_updates(&group));
+
+        match result {
+            Ok(r) => json_out(&mut env, &rekey_json(&r)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Each other member's standing on the current epoch. Null unless this device is
+/// the group's admin.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeGroupEpochStatusJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let group = match read_string(&mut env, &group_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        let status = with_node!(std::ptr::null_mut(), |node| node.group_epoch_status(&group));
+
+        match status {
+            Ok(s) => json_out(&mut env, &group_epoch_status_json(&s)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Deprecated in favour of `nativeAddToGroup`: existing members never hear about
+/// this add. Adds a peer to a group, returning the invite packet to transmit. Null
+/// when this device is not the group's admin or has no session with the peer.
 #[no_mangle]
 pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeInviteToGroup(
     mut env: JNIEnv,
@@ -625,7 +762,8 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeRemoveF
     })
 }
 
-/// Rotates a group key without changing membership, for a suspected compromise.
+/// Rotates a group key without changing membership. Every listed member gets the
+/// new key, so this is not the recovery for a seized device.
 #[no_mangle]
 pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeRekeyGroup(
     mut env: JNIEnv,
@@ -813,6 +951,8 @@ struct ReceiveResultJson {
     /// "Joined", "Rekeyed", "Removed", or "Stale" when an invite changed this
     /// device's membership.
     group_event: Option<&'static str>,
+    /// Set when a member confirmed a group epoch this device sent them as admin.
+    group_epoch_ack: Option<GroupEpochAckJson>,
 }
 
 fn packet_type_name(t: PacketType) -> &'static str {
@@ -898,6 +1038,11 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeProcess
             group_id: outcome.group_id.as_ref().map(|g| to_hex(g)),
             group_name: outcome.group_name.clone(),
             group_event: outcome.group_event.as_ref().map(invite_outcome_name),
+            group_epoch_ack: outcome.group_epoch_ack.as_ref().map(|a| GroupEpochAckJson {
+                group_id: to_hex(&a.group_id),
+                member_id: to_hex(&a.member),
+                epoch: a.epoch,
+            }),
         };
 
         json_out(&mut env, &result)
