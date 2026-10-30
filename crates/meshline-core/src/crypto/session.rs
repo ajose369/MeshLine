@@ -19,6 +19,12 @@
 //! keys are on disk rather than only in RAM. That is why the vault they are
 //! written to is encrypted under a hardware-backed key and why
 //! [`crate::MeshNode::wipe_secure_state`] exists.
+//!
+//! Persisting a counter is dangerous in a different way: a restored snapshot
+//! must never hand out a counter that was already used under the same key. So
+//! counters are spent only from a range already reserved on disk, and a restore
+//! resumes from the end of that range. See
+//! `docs/decisions/2026-10-31-session-nonce-safety.md`.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -42,6 +48,22 @@ const WINDOW_WORDS: usize = (REPLAY_WINDOW / 64) as usize;
 
 /// Bytes of framing overhead added to every ciphertext: 8-byte counter + tag.
 pub const TRANSPORT_OVERHEAD: usize = 8 + 16;
+
+/// How many counters one durable write reserves ahead.
+///
+/// A crash abandons at most this many, and a receiver only tolerates the jump
+/// while older in-flight traffic stays inside [`REPLAY_WINDOW`], so this is kept
+/// well below it. Larger would mean fewer writes but more lost traffic per crash.
+pub const NONCE_RESERVATION_BLOCK: u64 = 64;
+
+/// Below this many spendable counters, the next durable write should happen
+/// before sending rather than after running out.
+pub const NONCE_RESERVATION_LOW_WATER: u64 = 16;
+
+/// Added to a counter read from a pre-reservation (v1) vault. Those builds could
+/// have spent an unknown number of counters past their last save; no phone sends
+/// a million messages between two saves.
+const LEGACY_COUNTER_SKIP: u64 = 1 << 20;
 
 /// A sliding replay window.
 ///
@@ -155,10 +177,54 @@ pub struct TransportSession {
     peer_identity_pubkey: [u8; 32],
     peer_node_id: [u8; 16],
     sending_counter: u64,
+    /// End of the range written (or about to be written) to the vault. A restore
+    /// resumes sending here, whatever `sending_counter` said.
+    reserved_until: u64,
     replay: ReplayWindow,
     /// Unix seconds at which the session was established, for staleness policy
     /// and for showing the user how old a secure link is.
     pub established_at: u64,
+    /// Counters below this are known to be covered by a durable write. Never
+    /// persisted, so a session cannot send until a write has committed.
+    #[serde(skip)]
+    durable_limit: u64,
+}
+
+/// A session as v1 vaults stored it, before reserved ranges existed.
+#[derive(Deserialize)]
+pub(crate) struct LegacyTransportSession {
+    sending_key: [u8; 32],
+    receiving_key: [u8; 32],
+    peer_identity_pubkey: [u8; 32],
+    peer_node_id: [u8; 16],
+    sending_counter: u64,
+    replay: ReplayWindow,
+    established_at: u64,
+}
+
+impl Drop for LegacyTransportSession {
+    fn drop(&mut self) {
+        self.sending_key.zeroize();
+        self.receiving_key.zeroize();
+    }
+}
+
+impl From<LegacyTransportSession> for TransportSession {
+    /// Its counter cannot be trusted, since v1 released ciphertext before saving,
+    /// so the migrated session resumes far enough ahead to clear anything spent.
+    fn from(legacy: LegacyTransportSession) -> Self {
+        Self {
+            sending_key: legacy.sending_key,
+            receiving_key: legacy.receiving_key,
+            peer_identity_pubkey: legacy.peer_identity_pubkey,
+            peer_node_id: legacy.peer_node_id,
+            sending_counter: legacy.sending_counter,
+            reserved_until: legacy.sending_counter.saturating_add(LEGACY_COUNTER_SKIP),
+            replay: legacy.replay.clone(),
+            established_at: legacy.established_at,
+            durable_limit: 0,
+        }
+    }
 }
 
 impl Drop for TransportSession {
@@ -191,8 +257,10 @@ impl TransportSession {
             peer_identity_pubkey,
             peer_node_id: node_id_from_pubkey(&peer_identity_pubkey),
             sending_counter: 0,
+            reserved_until: 0,
             replay: ReplayWindow::new(),
             established_at,
+            durable_limit: 0,
         }
     }
 
@@ -204,6 +272,37 @@ impl TransportSession {
         self.peer_identity_pubkey
     }
 
+    /// Extends the reservation, ahead of sealing this session into the vault.
+    /// Nothing becomes spendable until [`commit_reservation`](Self::commit_reservation).
+    pub(crate) fn reserve_for_export(&mut self) {
+        self.reserved_until = self
+            .reserved_until
+            .max(self.sending_counter.saturating_add(NONCE_RESERVATION_BLOCK));
+    }
+
+    /// The sealed state holding the reservation is durable, so it may be spent.
+    pub(crate) fn commit_reservation(&mut self) {
+        self.durable_limit = self.reserved_until;
+    }
+
+    /// Brings a session read from the vault back to life: everything below the
+    /// reservation may already have been used by the process that wrote it, so
+    /// none of it can be spent again.
+    pub(crate) fn resume_after_restore(&mut self) {
+        self.sending_counter = self.sending_counter.max(self.reserved_until);
+        self.reserved_until = self.sending_counter;
+        self.durable_limit = self.sending_counter;
+    }
+
+    /// Counters that can be spent without another durable write.
+    pub fn spendable_counters(&self) -> u64 {
+        self.durable_limit.saturating_sub(self.sending_counter)
+    }
+
+    /// Encrypts one message, spending a counter from the durable reservation.
+    ///
+    /// Fails with [`CryptoError::NonceReservationExhausted`] rather than use a
+    /// counter a crash could hand out again.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if plaintext.len() + TRANSPORT_OVERHEAD > MAX_TRANSPORT_MESSAGE {
             return Err(CryptoError::MessageTooLarge);
@@ -213,6 +312,9 @@ impl TransportSession {
         let counter = self.sending_counter;
         if counter == u64::MAX {
             return Err(CryptoError::SessionExhausted);
+        }
+        if counter >= self.durable_limit {
+            return Err(CryptoError::NonceReservationExhausted);
         }
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.sending_key));
@@ -274,9 +376,24 @@ mod tests {
 
     fn pair() -> (TransportSession, TransportSession) {
         let split = ([1u8; 32], [2u8; 32]);
-        let a = TransportSession::from_split(split, true, [9u8; 32], 0);
-        let b = TransportSession::from_split(split, false, [8u8; 32], 0);
+        let mut a = TransportSession::from_split(split, true, [9u8; 32], 0);
+        let mut b = TransportSession::from_split(split, false, [8u8; 32], 0);
+        for session in [&mut a, &mut b] {
+            session.reserve_for_export();
+            session.commit_reservation();
+        }
         (a, b)
+    }
+
+    /// Exactly what a restart does: read the bytes back and resume.
+    fn restore(bytes: &[u8]) -> TransportSession {
+        let mut restored: TransportSession = bincode::deserialize(bytes).unwrap();
+        restored.resume_after_restore();
+        restored
+    }
+
+    fn counter_of(frame: &[u8]) -> u64 {
+        u64::from_le_bytes(frame[..8].try_into().unwrap())
     }
 
     #[test]
@@ -317,6 +434,141 @@ mod tests {
             restored.decrypt(&ct),
             Err(CryptoError::ReplayedNonce)
         ));
+    }
+
+    /// REVIEW C1: persist n, encrypt with n, lose the process, restore, encrypt.
+    #[test]
+    fn a_restored_snapshot_cannot_repeat_a_counter() {
+        let (mut a, mut b) = pair();
+        a.reserve_for_export();
+        let snapshot = bincode::serialize(&a).unwrap();
+        a.commit_reservation();
+
+        let first = a.encrypt(b"message A").unwrap();
+
+        // The process dies here, and only the snapshot survives.
+        let mut restored = restore(&snapshot);
+        assert!(matches!(
+            restored.encrypt(b"message B"),
+            Err(CryptoError::NonceReservationExhausted)
+        ));
+
+        restored.reserve_for_export();
+        restored.commit_reservation();
+        let second = restored.encrypt(b"message B").unwrap();
+
+        assert!(counter_of(&second) > counter_of(&first));
+        assert_eq!(b.decrypt(&first).unwrap(), b"message A");
+        assert_eq!(b.decrypt(&second).unwrap(), b"message B");
+    }
+
+    #[test]
+    fn a_new_session_cannot_send_before_a_durable_write() {
+        let split = ([1u8; 32], [2u8; 32]);
+        let mut a = TransportSession::from_split(split, true, [9u8; 32], 0);
+        assert!(matches!(
+            a.encrypt(b"too soon"),
+            Err(CryptoError::NonceReservationExhausted)
+        ));
+
+        // Reserving is not enough: the write may still fail.
+        a.reserve_for_export();
+        assert!(matches!(
+            a.encrypt(b"too soon"),
+            Err(CryptoError::NonceReservationExhausted)
+        ));
+
+        a.commit_reservation();
+        a.encrypt(b"now it is safe").unwrap();
+    }
+
+    #[test]
+    fn a_reservation_runs_out_rather_than_outrunning_the_disk() {
+        let (mut a, _b) = pair();
+        for _ in 0..NONCE_RESERVATION_BLOCK {
+            a.encrypt(b"x").unwrap();
+        }
+        assert_eq!(a.spendable_counters(), 0);
+        assert!(matches!(
+            a.encrypt(b"x"),
+            Err(CryptoError::NonceReservationExhausted)
+        ));
+    }
+
+    /// The REVIEW section 5 gate: no repeated key/nonce across 10,000 injected
+    /// crash schedules, with the crash landing before the write, after the write
+    /// but before the commit, or after the commit. The generator is seeded so a
+    /// failure reproduces.
+    #[test]
+    fn no_counter_repeats_across_ten_thousand_crash_schedules() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound
+        };
+
+        let mut crashes = 0u64;
+        for _ in 0..10_000 {
+            let split = ([1u8; 32], [2u8; 32]);
+            let mut live = TransportSession::from_split(split, true, [9u8; 32], 0);
+            let mut disk = bincode::serialize(&live).unwrap();
+            let mut used = std::collections::HashSet::new();
+
+            for _ in 0..next(4) + 1 {
+                live.reserve_for_export();
+                let exported = bincode::serialize(&live).unwrap();
+                let wrote = next(4) != 0;
+                if wrote {
+                    disk = exported;
+                    if next(4) == 0 {
+                        crashes += 1;
+                        live = restore(&disk);
+                        continue;
+                    }
+                    live.commit_reservation();
+                }
+
+                // Mostly short bursts, with enough long ones to hit the limit.
+                let burst = if next(8) == 0 {
+                    NONCE_RESERVATION_BLOCK * 2
+                } else {
+                    next(4)
+                };
+                for _ in 0..burst {
+                    match live.encrypt(b"x") {
+                        Ok(frame) => assert!(
+                            used.insert(counter_of(&frame)),
+                            "counter {} was used twice",
+                            counter_of(&frame)
+                        ),
+                        Err(CryptoError::NonceReservationExhausted) => break,
+                        Err(other) => panic!("unexpected failure: {other}"),
+                    }
+                }
+                if next(2) == 0 {
+                    crashes += 1;
+                    live = restore(&disk);
+                }
+            }
+        }
+        assert!(crashes > 10_000, "the schedules must really crash");
+    }
+
+    #[test]
+    fn a_crash_stays_inside_what_the_replay_window_tolerates() {
+        let (mut a, mut b) = pair();
+        let delayed = a.encrypt(b"late, but still valid").unwrap();
+
+        a.reserve_for_export();
+        let mut restored = restore(&bincode::serialize(&a).unwrap());
+        restored.reserve_for_export();
+        restored.commit_reservation();
+        let after_crash = restored.encrypt(b"after the crash").unwrap();
+
+        b.decrypt(&after_crash).unwrap();
+        assert_eq!(b.decrypt(&delayed).unwrap(), b"late, but still valid");
     }
 
     #[test]

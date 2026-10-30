@@ -19,7 +19,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use snow::{Builder, HandshakeState};
 use std::collections::HashMap;
 
-use super::session::TransportSession;
+use super::session::{TransportSession, NONCE_RESERVATION_LOW_WATER};
 use super::CryptoError;
 use crate::packet::schema::node_id_from_pubkey;
 
@@ -385,6 +385,39 @@ impl SessionManager {
             .decrypt(framed)
     }
 
+    /// Whether a message to `peer` can be encrypted right now, so a caller can
+    /// refuse before changing any other state.
+    pub fn can_send_to(&self, peer: &[u8; 16]) -> Result<(), CryptoError> {
+        match self.established.get(peer) {
+            None => Err(CryptoError::NoSession),
+            Some(s) if s.spendable_counters() == 0 => Err(CryptoError::NonceReservationExhausted),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// True when a session is out of, or close to running out of, counters
+    /// covered by a durable write.
+    pub fn needs_nonce_reservation(&self) -> bool {
+        self.established
+            .values()
+            .any(|s| s.spendable_counters() < NONCE_RESERVATION_LOW_WATER)
+    }
+
+    /// Extends every session's reservation, ahead of sealing them.
+    pub fn reserve_for_export(&mut self) {
+        for session in self.established.values_mut() {
+            session.reserve_for_export();
+        }
+    }
+
+    /// The state sealed by the last export is durable, so its reservations may be
+    /// spent. A session established since then reserved nothing and stays refused.
+    pub fn commit_reservations(&mut self) {
+        for session in self.established.values_mut() {
+            session.commit_reservation();
+        }
+    }
+
     pub fn drop_session(&mut self, peer: &[u8; 16]) {
         self.pending.remove(peer);
         self.established.remove(peer);
@@ -406,7 +439,8 @@ impl SessionManager {
     /// Reinstalls sessions read back from the vault, keyed by the identity that
     /// was verified when each handshake completed.
     pub fn install_sessions(&mut self, sessions: Vec<TransportSession>) {
-        for session in sessions {
+        for mut session in sessions {
+            session.resume_after_restore();
             self.established.insert(session.peer_node_id(), session);
         }
     }
@@ -447,6 +481,11 @@ mod tests {
             .accept_handshake(alice_id, &msg3, bob_key, NOW)
             .unwrap()
             .is_none());
+
+        for manager in [&mut alice, &mut bob] {
+            manager.reserve_for_export();
+            manager.commit_reservations();
+        }
 
         (alice, bob, alice_id, bob_id)
     }
