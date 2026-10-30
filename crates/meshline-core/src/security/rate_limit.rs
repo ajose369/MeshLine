@@ -129,7 +129,10 @@ mod tests {
         let mut bucket = TokenBucket::new(1.0, 1000.0);
         assert!(bucket.try_consume(1.0));
         std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(bucket.try_consume(1.0), "tokens must accrue with elapsed time");
+        assert!(
+            bucket.try_consume(1.0),
+            "tokens must accrue with elapsed time"
+        );
     }
 
     #[test]

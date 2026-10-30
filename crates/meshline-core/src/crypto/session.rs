@@ -129,7 +129,11 @@ impl ReplayWindow {
 
         if words > 0 {
             for i in (0..WINDOW_WORDS).rev() {
-                self.bitmap[i] = if i >= words { self.bitmap[i - words] } else { 0 };
+                self.bitmap[i] = if i >= words {
+                    self.bitmap[i - words]
+                } else {
+                    0
+                };
             }
         }
         if bits > 0 {

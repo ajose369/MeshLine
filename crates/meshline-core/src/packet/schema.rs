@@ -374,7 +374,9 @@ mod tests {
         let (_, packet) = signed_packet();
         let ts = packet.header.timestamp;
         packet.check_freshness(ts).unwrap();
-        assert!(packet.check_freshness(ts + MAX_PACKET_AGE_SECS + 1).is_err());
+        assert!(packet
+            .check_freshness(ts + MAX_PACKET_AGE_SECS + 1)
+            .is_err());
         assert!(packet
             .check_freshness(ts - MAX_CLOCK_SKEW_SECS - 1)
             .is_err());

@@ -117,7 +117,10 @@ mod tests {
         let mut sealed = seal(&KEY, b"state").unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
-        assert!(matches!(open(&KEY, &sealed), Err(CryptoError::VaultCorrupt)));
+        assert!(matches!(
+            open(&KEY, &sealed),
+            Err(CryptoError::VaultCorrupt)
+        ));
     }
 
     #[test]
@@ -140,6 +143,9 @@ mod tests {
     fn an_unknown_version_is_refused() {
         let mut sealed = seal(&KEY, b"state").unwrap();
         sealed[0] = 99;
-        assert!(matches!(open(&KEY, &sealed), Err(CryptoError::VaultVersion)));
+        assert!(matches!(
+            open(&KEY, &sealed),
+            Err(CryptoError::VaultVersion)
+        ));
     }
 }

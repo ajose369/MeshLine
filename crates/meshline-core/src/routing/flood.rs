@@ -87,7 +87,6 @@ impl RoutingEngine {
         let cache = self.seen_cache.lock().unwrap();
         cache.contains(msg_id)
     }
-
 }
 
 #[cfg(test)]
@@ -186,7 +185,10 @@ mod tests {
         engine.mark_seen(&[1u8; 16], 0);
         engine.mark_seen(&[2u8; 16], 0);
         engine.mark_seen(&[3u8; 16], 0);
-        assert!(!engine.is_seen(&[1u8; 16]), "oldest entry should be evicted");
+        assert!(
+            !engine.is_seen(&[1u8; 16]),
+            "oldest entry should be evicted"
+        );
         assert!(engine.is_seen(&[3u8; 16]));
     }
 }

@@ -17,8 +17,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use meshline_core::{
-    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag,
-    MeshNode, PacketType, ResourcePinType,
+    node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag, MeshNode,
+    PacketType, ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -151,17 +151,15 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeIsReady
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    guard(JNI_FALSE, || {
-        match NODE_INSTANCE.lock() {
-            Ok(slot) => {
-                if slot.is_some() {
-                    JNI_TRUE
-                } else {
-                    JNI_FALSE
-                }
+    guard(JNI_FALSE, || match NODE_INSTANCE.lock() {
+        Ok(slot) => {
+            if slot.is_some() {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
             }
-            Err(_) => JNI_FALSE,
         }
+        Err(_) => JNI_FALSE,
     })
 }
 
@@ -295,7 +293,10 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeCreateC
     message: JString,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
-        let recipient = match read_string(&mut env, &recipient_id_hex).as_deref().and_then(node_id_from_hex) {
+        let recipient = match read_string(&mut env, &recipient_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
             Some(r) => r,
             None => return std::ptr::null_mut(),
         };
@@ -323,7 +324,10 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeBeginHa
     peer_id_hex: JString,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
-        let peer = match read_string(&mut env, &peer_id_hex).as_deref().and_then(node_id_from_hex) {
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
             Some(p) => p,
             None => return std::ptr::null_mut(),
         };
@@ -345,7 +349,10 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeHasSess
     peer_id_hex: JString,
 ) -> jboolean {
     guard(JNI_FALSE, || {
-        let peer = match read_string(&mut env, &peer_id_hex).as_deref().and_then(node_id_from_hex) {
+        let peer = match read_string(&mut env, &peer_id_hex)
+            .as_deref()
+            .and_then(node_id_from_hex)
+        {
             Some(p) => p,
             None => return JNI_FALSE,
         };
@@ -854,9 +861,7 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeProcess
                 .as_ref()
                 .and_then(|p| p.to_bytes().ok())
                 .map(|b| to_hex(&b)),
-            plaintext: outcome
-                .plaintext
-                .and_then(|p| String::from_utf8(p).ok()),
+            plaintext: outcome.plaintext.and_then(|p| String::from_utf8(p).ok()),
             sos_text,
             group_id: outcome.group_id.as_ref().map(|g| to_hex(g)),
             group_name: outcome.group_name.clone(),

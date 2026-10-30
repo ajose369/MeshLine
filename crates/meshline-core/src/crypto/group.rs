@@ -245,11 +245,7 @@ impl Group {
     /// The sender is taken from the already-verified packet header, never from
     /// the ciphertext, so a member cannot relabel another member's message as
     /// their own.
-    pub fn decrypt(
-        &mut self,
-        sender_id: &[u8; 16],
-        framed: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt(&mut self, sender_id: &[u8; 16], framed: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if framed.len() < GROUP_OVERHEAD || framed.len() > MAX_GROUP_MESSAGE {
             return Err(CryptoError::MessageTooLarge);
         }
@@ -468,7 +464,10 @@ impl GroupStore {
         if !group.is_admin(actor) {
             return Err(CryptoError::NotGroupAdmin);
         }
-        let next_epoch = group.epoch.checked_add(1).ok_or(CryptoError::GroupExhausted)?;
+        let next_epoch = group
+            .epoch
+            .checked_add(1)
+            .ok_or(CryptoError::GroupExhausted)?;
 
         let mut key = [0u8; 32];
         rand::thread_rng().fill(&mut key);
@@ -480,7 +479,12 @@ impl GroupStore {
         group.sending_counter = 0;
         group.replay.clear();
 
-        Ok(group.members.iter().copied().filter(|m| m != actor).collect())
+        Ok(group
+            .members
+            .iter()
+            .copied()
+            .filter(|m| m != actor)
+            .collect())
     }
 
     /// Applies an invite that arrived over a verified pairwise session.
@@ -594,19 +598,31 @@ mod tests {
     fn the_ciphertext_does_not_leak_the_message() {
         let (mut alice, _b, _c, gid) = three_person_group();
         let secret = b"medic needed at the south barricade";
-        let ct = alice.get_mut(&gid).unwrap().encrypt(&ALICE, secret).unwrap();
+        let ct = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, secret)
+            .unwrap();
         assert!(!ct.windows(secret.len()).any(|w| w == secret));
     }
 
     #[test]
     fn a_non_member_with_the_wrong_key_learns_nothing() {
         let (mut alice, _b, _c, gid) = three_person_group();
-        let ct = alice.get_mut(&gid).unwrap().encrypt(&ALICE, b"regroup").unwrap();
+        let ct = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, b"regroup")
+            .unwrap();
 
         // Mallory has her own group, and no way to match the tag or the key.
         let mut mallory = GroupStore::new();
         let other = mallory.create(MALLORY, "not the same group", 1000).unwrap();
-        assert!(mallory.get_mut(&other).unwrap().decrypt(&ALICE, &ct).is_err());
+        assert!(mallory
+            .get_mut(&other)
+            .unwrap()
+            .decrypt(&ALICE, &ct)
+            .is_err());
     }
 
     #[test]
@@ -614,7 +630,11 @@ mod tests {
         let (alice, bob, _c, gid) = three_person_group();
         let tag = alice.get(&gid).unwrap().tag();
 
-        assert_eq!(bob.by_tag(&tag), Some(gid), "a member must recognise the tag");
+        assert_eq!(
+            bob.by_tag(&tag),
+            Some(gid),
+            "a member must recognise the tag"
+        );
 
         let mut mallory = GroupStore::new();
         mallory.create(MALLORY, "other", 1000).unwrap();
@@ -754,7 +774,11 @@ mod tests {
     #[test]
     fn a_member_cannot_relabel_anothers_message_as_their_own() {
         let (mut alice, mut bob, _c, gid) = three_person_group();
-        let ct = alice.get_mut(&gid).unwrap().encrypt(&ALICE, b"hold").unwrap();
+        let ct = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, b"hold")
+            .unwrap();
 
         // The sender is bound into the AAD, so claiming a different author
         // breaks authentication rather than silently succeeding.
@@ -776,8 +800,16 @@ mod tests {
     #[test]
     fn out_of_order_group_messages_still_decrypt() {
         let (mut alice, mut bob, _c, gid) = three_person_group();
-        let a1 = alice.get_mut(&gid).unwrap().encrypt(&ALICE, b"one").unwrap();
-        let a2 = alice.get_mut(&gid).unwrap().encrypt(&ALICE, b"two").unwrap();
+        let a1 = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, b"one")
+            .unwrap();
+        let a2 = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, b"two")
+            .unwrap();
 
         let group = bob.get_mut(&gid).unwrap();
         assert_eq!(group.decrypt(&ALICE, &a2).unwrap(), b"two");
@@ -803,13 +835,21 @@ mod tests {
     #[test]
     fn a_group_survives_serialization() {
         let (mut alice, bob, _c, gid) = three_person_group();
-        let ct = alice.get_mut(&gid).unwrap().encrypt(&ALICE, b"persisted").unwrap();
+        let ct = alice
+            .get_mut(&gid)
+            .unwrap()
+            .encrypt(&ALICE, b"persisted")
+            .unwrap();
 
         let bytes = bincode::serialize(&bob).unwrap();
         let mut restored: GroupStore = bincode::deserialize(&bytes).unwrap();
 
         assert_eq!(
-            restored.get_mut(&gid).unwrap().decrypt(&ALICE, &ct).unwrap(),
+            restored
+                .get_mut(&gid)
+                .unwrap()
+                .decrypt(&ALICE, &ct)
+                .unwrap(),
             b"persisted"
         );
     }
