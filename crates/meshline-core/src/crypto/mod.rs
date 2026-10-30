@@ -4,10 +4,12 @@
 //! - [`session`] carries traffic on an established session, in a form that
 //!   survives a restart.
 //! - [`group`] layers private groups on top of those pairwise sessions.
+//! - [`epoch_acks`] records which members confirmed which group epoch.
 //! - [`trust`] turns "the key is authentic" into "the human is who they claim",
 //!   which cryptography alone cannot do.
 //! - [`vault`] encrypts all of the above at rest.
 
+pub mod epoch_acks;
 pub mod group;
 pub mod noise;
 pub mod session;

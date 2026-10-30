@@ -9,3 +9,9 @@ Newest entry at the bottom. Only Claude writes here. Gemini reads the latest ent
 - **Next:** A-001 (format the workspace, make `cargo fmt` blocking) once X-001 has brought `main` up to date.
 - **For the other lane:** the bridge (`MeshCoreBridge.kt`), `security/` and `db/EncryptedMessageStore.kt` are
   Lane A's. Need something there → `tasks/B-RFC-###.md`.
+
+## 2026-10-31 — Claude
+- **Worked on:** A-103 (group membership epochs).
+- **Next:** A-109 (messages in flight across a rotation).
+- **For the other lane:** A-RFC-002. `inviteToGroup` is deprecated and keeps H5 alive on phones; move to
+  `addToGroup` and queue every packet it returns. B-111 gets `groupEpochStatusJson` and `removeAndRotate`.

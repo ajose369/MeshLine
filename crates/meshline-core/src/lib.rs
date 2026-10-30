@@ -7,6 +7,7 @@ pub mod routing;
 pub mod security;
 pub mod transport;
 
+use bincode::Options;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::Rng;
@@ -14,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+pub use crypto::epoch_acks::{
+    GroupEpochAck, GroupEpochAcks, GroupEpochStatus, MemberEpochState, MemberEpochStatus,
+};
 pub use crypto::group::{
     Group, GroupInvite, GroupStore, InviteOutcome, MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
 };
@@ -72,7 +76,8 @@ pub enum MeshError {
 /// needs to be told that rather than discovering it through silence.
 #[derive(Debug, Clone)]
 pub struct GroupRekeyResult {
-    /// Invite packets to transmit, one per reachable member.
+    /// Invite packets to transmit, one per reachable member. Building one says
+    /// nothing about delivery: see [`MeshNode::group_epoch_status`].
     pub invites: Vec<Packet>,
     /// Members with no pairwise session, who therefore did not get the new key.
     pub unreachable: Vec<[u8; 16]>,
@@ -103,6 +108,8 @@ pub struct ReceiveOutcome {
     pub group_name: Option<String>,
     /// Set when a group invite changed this device's membership.
     pub group_event: Option<InviteOutcome>,
+    /// Set when a member confirmed an epoch this device sent them as admin.
+    pub group_epoch_ack: Option<GroupEpochAck>,
 }
 
 pub struct MeshNode {
@@ -115,6 +122,7 @@ pub struct MeshNode {
     pub sessions: Arc<Mutex<SessionManager>>,
     pub groups: Arc<Mutex<GroupStore>>,
     pub trust: Arc<Mutex<TrustStore>>,
+    group_epoch_acks: Mutex<GroupEpochAcks>,
 }
 
 /// The secure state as it is written to the vault.
@@ -165,6 +173,7 @@ impl MeshNode {
             sessions: Arc::new(Mutex::new(SessionManager::new())),
             groups: Arc::new(Mutex::new(GroupStore::new())),
             trust: Arc::new(Mutex::new(TrustStore::new())),
+            group_epoch_acks: Mutex::new(GroupEpochAcks::default()),
         }
     }
 
@@ -415,7 +424,46 @@ impl MeshNode {
         Ok(groups.create(self.node_id, name, Self::now())?)
     }
 
-    /// Adds a peer to a group and returns the invite to send them.
+    /// Adds a peer to a group under a new key and epoch, returning one invite per
+    /// member, old and new.
+    ///
+    /// Every member has to hear about the change or they will reject the new
+    /// member's messages, and rotating means the new member gets no key to traffic
+    /// recorded before they joined. Without a session to the peer this fails before
+    /// anything rotates, so an add that cannot happen costs the group nothing.
+    /// A peer who is already a member just gets the current epoch again.
+    pub fn add_to_group(
+        &self,
+        group_id: &[u8; 16],
+        peer_id: [u8; 16],
+    ) -> Result<GroupRekeyResult, MeshError> {
+        let already_member = {
+            let groups = self.groups.lock().expect("group mutex poisoned");
+            let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+            if !group.is_admin(&self.node_id) {
+                return Err(CryptoError::NotGroupAdmin.into());
+            }
+            group.is_member(&peer_id)
+        };
+        if already_member {
+            return self.distribute_group_key(group_id, &[peer_id]);
+        }
+        if !self.has_session_with(&peer_id) {
+            return Err(MeshError::NoSession);
+        }
+        let recipients = {
+            let mut groups = self.groups.lock().expect("group mutex poisoned");
+            groups.add_member_and_rekey(group_id, &self.node_id, peer_id)?
+        };
+        self.distribute_group_key(group_id, &recipients)
+    }
+
+    /// Adds a peer without rotating and returns a single invite.
+    ///
+    /// Deprecated: existing members never hear about the new member and reject
+    /// their messages (REVIEW H5), and the new member gets the key to earlier
+    /// traffic. Kept only until the app moves to [`add_to_group`](Self::add_to_group).
+    /// It cannot simply rotate, because its one packet would lock out everyone else.
     ///
     /// The group key travels inside the pairwise Noise session, so a peer you
     /// have not completed a handshake with cannot be added at all. That is
@@ -439,14 +487,31 @@ impl MeshNode {
             return Err(MeshError::NoSession);
         }
 
-        let invite_bytes = {
+        let (epoch, invite_bytes) = {
             let mut groups = self.groups.lock().expect("group mutex poisoned");
             groups.add_member(group_id, &self.node_id, peer_id)?;
             let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
-            crypto::group::encode_invite(&group.to_invite())?
+            (
+                group.epoch,
+                crypto::group::encode_invite(&group.to_invite())?,
+            )
         };
 
-        self.sealed_invite_packet(peer_id, &invite_bytes)
+        let packet = self.sealed_invite_packet(peer_id, &invite_bytes)?;
+        self.record_invite_sent(&packet, group_id, epoch);
+        Ok(packet)
+    }
+
+    fn record_invite_sent(&self, packet: &Packet, group_id: &[u8; 16], epoch: u32) {
+        self.group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned")
+            .record_sent(
+                packet.header.msg_id,
+                *group_id,
+                epoch,
+                packet.header.recipient_id,
+            );
     }
 
     /// Wraps an invite in a pairwise session and signs the resulting packet.
@@ -471,6 +536,9 @@ impl MeshNode {
 
     /// Removes a member and rekeys the group, returning the invites that carry
     /// the new key to everyone who remains.
+    ///
+    /// This is the recovery for a seized or compromised device. The removed member
+    /// is sent nothing, because any invite would carry the new key.
     pub fn remove_from_group(
         &self,
         group_id: &[u8; 16],
@@ -480,11 +548,17 @@ impl MeshNode {
             let mut groups = self.groups.lock().expect("group mutex poisoned");
             groups.remove_member(group_id, &self.node_id, member)?
         };
+        self.group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned")
+            .forget_member(group_id, member);
         self.distribute_group_key(group_id, &remaining)
     }
 
-    /// Rotates a group's key without changing its membership, for when a
-    /// member's device may have been seized or compromised.
+    /// Rotates a group's key without changing its membership.
+    ///
+    /// This does not recover from a seized device: every listed member gets the new
+    /// key, including that one. Use [`remove_from_group`](Self::remove_from_group).
     pub fn rekey_group(&self, group_id: &[u8; 16]) -> Result<GroupRekeyResult, MeshError> {
         let remaining = {
             let mut groups = self.groups.lock().expect("group mutex poisoned");
@@ -500,10 +574,13 @@ impl MeshNode {
         group_id: &[u8; 16],
         members: &[[u8; 16]],
     ) -> Result<GroupRekeyResult, MeshError> {
-        let invite_bytes = {
+        let (epoch, invite_bytes) = {
             let groups = self.groups.lock().expect("group mutex poisoned");
             let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
-            crypto::group::encode_invite(&group.to_invite())?
+            (
+                group.epoch,
+                crypto::group::encode_invite(&group.to_invite())?,
+            )
         };
 
         let mut invites = Vec::new();
@@ -513,7 +590,10 @@ impl MeshNode {
                 continue;
             }
             match self.sealed_invite_packet(*member, &invite_bytes) {
-                Ok(packet) => invites.push(packet),
+                Ok(packet) => {
+                    self.record_invite_sent(&packet, group_id, epoch);
+                    invites.push(packet);
+                }
                 Err(_) => unreachable.push(*member),
             }
         }
@@ -521,6 +601,48 @@ impl MeshNode {
         Ok(GroupRekeyResult {
             invites,
             unreachable,
+        })
+    }
+
+    /// Builds the current epoch's invite again for every member who has not
+    /// confirmed it, for use after a lost packet or a new session.
+    pub fn resend_group_updates(&self, group_id: &[u8; 16]) -> Result<GroupRekeyResult, MeshError> {
+        let status = self.group_epoch_status(group_id)?;
+        let unconfirmed: Vec<[u8; 16]> = status
+            .members
+            .iter()
+            .filter(|m| m.state != MemberEpochState::Acknowledged)
+            .map(|m| m.member)
+            .collect();
+        self.distribute_group_key(group_id, &unconfirmed)
+    }
+
+    /// Where every other member stands on the current epoch. Admin only: nobody
+    /// else sends invites, so nobody else has anything to report.
+    pub fn group_epoch_status(&self, group_id: &[u8; 16]) -> Result<GroupEpochStatus, MeshError> {
+        let groups = self.groups.lock().expect("group mutex poisoned");
+        let group = groups.get(group_id).ok_or(CryptoError::UnknownGroup)?;
+        if !group.is_admin(&self.node_id) {
+            return Err(CryptoError::NotGroupAdmin.into());
+        }
+        let acks = self
+            .group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned");
+        let members = group
+            .members
+            .iter()
+            .filter(|m| **m != self.node_id)
+            .map(|m| MemberEpochStatus {
+                member: *m,
+                acked_epoch: acks.acked_epoch(group_id, m),
+                state: acks.state(group_id, m, group.epoch),
+            })
+            .collect();
+        Ok(GroupEpochStatus {
+            group_id: *group_id,
+            epoch: group.epoch,
+            members,
         })
     }
 
@@ -552,6 +674,10 @@ impl MeshNode {
 
     /// Leaves a group, deleting its key from this device.
     pub fn leave_group(&self, group_id: &[u8; 16]) -> bool {
+        self.group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned")
+            .forget_group(group_id);
         self.groups
             .lock()
             .expect("group mutex poisoned")
@@ -567,6 +693,10 @@ impl MeshNode {
     /// The key belongs in platform-protected storage. Everything in here is
     /// live key material, which is exactly what makes a seized device dangerous
     /// to the rest of the mesh.
+    ///
+    /// The group epoch ACK table follows the state as a second value rather than a
+    /// new field, so a blob from before it existed still opens and a build that
+    /// does not know about it ignores it.
     pub fn export_secure_state(&self, vault_key: &[u8; 32]) -> Result<Vec<u8>, MeshError> {
         let sessions = self.sessions.lock().expect("session mutex poisoned");
         let groups = self.groups.lock().expect("group mutex poisoned");
@@ -577,8 +707,15 @@ impl MeshNode {
             groups: &groups,
             trust: &trust,
         };
-        let plaintext =
+        let mut plaintext =
             bincode::serialize(&state).map_err(|e| MeshError::Serialization(e.to_string()))?;
+        let acks = self
+            .group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned");
+        plaintext.extend(
+            bincode::serialize(&*acks).map_err(|e| MeshError::Serialization(e.to_string()))?,
+        );
 
         Ok(crypto::vault::seal(vault_key, &plaintext)?)
     }
@@ -589,8 +726,18 @@ impl MeshNode {
     /// with half a session table: the caller starts fresh and re-handshakes.
     pub fn import_secure_state(&self, vault_key: &[u8; 32], blob: &[u8]) -> Result<(), MeshError> {
         let plaintext = crypto::vault::open(vault_key, blob)?;
-        let state: SecureStateIn = bincode::deserialize(&plaintext)
+        let mut decoder = bincode::de::Deserializer::from_slice(
+            &plaintext,
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes(),
+        );
+        let state = SecureStateIn::deserialize(&mut decoder)
             .map_err(|e| MeshError::Serialization(e.to_string()))?;
+        // Absent from older blobs. The AEAD already vouched for these bytes, so
+        // running out of them can only mean that, and those members report as not
+        // sent rather than as holding a key on no evidence.
+        let acks = GroupEpochAcks::deserialize(&mut decoder).unwrap_or_default();
 
         self.sessions
             .lock()
@@ -598,6 +745,10 @@ impl MeshNode {
             .install_sessions(state.sessions);
         *self.groups.lock().expect("group mutex poisoned") = state.groups;
         *self.trust.lock().expect("trust mutex poisoned") = state.trust;
+        *self
+            .group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned") = acks;
         Ok(())
     }
 
@@ -613,6 +764,10 @@ impl MeshNode {
             .clear();
         self.groups.lock().expect("group mutex poisoned").clear();
         *self.trust.lock().expect("trust mutex poisoned") = TrustStore::new();
+        self.group_epoch_acks
+            .lock()
+            .expect("group epoch ack mutex poisoned")
+            .clear();
     }
 
     /// Validates and processes an inbound frame from any transport.
@@ -655,6 +810,7 @@ impl MeshNode {
         let mut group_id = None;
         let mut group_name = None;
         let mut group_event = None;
+        let mut group_epoch_ack = None;
         if !is_duplicate {
             match packet.header.packet_type {
                 PacketType::ResourcePin => {
@@ -709,6 +865,15 @@ impl MeshNode {
                         .decrypt_from(&packet.header.sender_id, &packet.payload)
                         .ok();
                 }
+                PacketType::Ack if addressed_to_us => {
+                    // sender_id was bound to the signing key in step 1, so this
+                    // compares the invite's recipient with who really signed.
+                    group_epoch_ack = self
+                        .group_epoch_acks
+                        .lock()
+                        .expect("group epoch ack mutex poisoned")
+                        .accept(&packet.header.sender_id, &packet.payload);
+                }
                 PacketType::GroupInvite if addressed_to_us => {
                     // An invite only means anything inside an authenticated
                     // pairwise session, so it is opened there first and the
@@ -756,9 +921,17 @@ impl MeshNode {
             }
         }
 
+        // An invite is acknowledged only when this device now holds that epoch or a
+        // later one. Removed means it holds nothing, and a refused or unreadable
+        // invite never sets group_event.
+        let holds_invited_epoch = matches!(
+            group_event,
+            Some(InviteOutcome::Joined | InviteOutcome::Rekeyed | InviteOutcome::Stale)
+        );
         let ack = if addressed_to_us && !is_duplicate {
             match packet.header.packet_type {
                 PacketType::Chat | PacketType::PrivateSos => Some(self.create_ack(&packet)?),
+                PacketType::GroupInvite if holds_invited_epoch => Some(self.create_ack(&packet)?),
                 _ => None,
             }
         } else {
@@ -783,6 +956,7 @@ impl MeshNode {
             group_id,
             group_name,
             group_event,
+            group_epoch_ack,
         })
     }
 
@@ -1206,14 +1380,396 @@ mod tests {
 
         let gid = alice.create_group("affinity").unwrap();
 
-        let to_bob = alice.invite_to_group(&gid, bob.node_id).unwrap();
-        let joined = bob.process_incoming(&wire(&to_bob)).unwrap();
+        let to_bob = alice.add_to_group(&gid, bob.node_id).unwrap();
+        let joined = bob.process_incoming(&wire(&to_bob.invites[0])).unwrap();
         assert_eq!(joined.group_event, Some(InviteOutcome::Joined));
 
+        add_and_deliver(alice, &gid, carol, &[bob, carol]);
+
+        gid
+    }
+
+    /// `alice` adds `peer`, and the update reaches every node in `everyone`.
+    fn add_and_deliver(alice: &MeshNode, gid: &[u8; 16], peer: &MeshNode, everyone: &[&MeshNode]) {
+        let update = alice.add_to_group(gid, peer.node_id).unwrap();
+        assert!(update.unreachable.is_empty());
+        deliver_invites(&update, everyone);
+    }
+
+    /// Hands each invite to the node it is addressed to, returning their ACKs.
+    fn deliver_invites(update: &GroupRekeyResult, everyone: &[&MeshNode]) -> Vec<Packet> {
+        let mut acks = Vec::new();
+        for invite in &update.invites {
+            let to = everyone
+                .iter()
+                .find(|n| n.node_id == invite.header.recipient_id)
+                .expect("invite addressed to a known node");
+            acks.extend(to.process_incoming(&wire(invite)).unwrap().ack);
+        }
+        acks
+    }
+
+    fn state_of(admin: &MeshNode, gid: &[u8; 16], member: &MeshNode) -> MemberEpochState {
+        admin
+            .group_epoch_status(gid)
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.member == member.node_id)
+            .expect("listed member")
+            .state
+    }
+
+    /// REVIEW H5 as it happened: the single-invite path leaves Bob rejecting Carol.
+    /// Pinned so the deprecated path is not mistaken for a safe one.
+    #[test]
+    fn h5_the_deprecated_single_invite_path_strands_existing_members() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+        handshake(&alice, &carol);
+        let gid = alice.create_group("affinity").unwrap();
+
+        let to_bob = alice.invite_to_group(&gid, bob.node_id).unwrap();
+        bob.process_incoming(&wire(&to_bob)).unwrap();
         let to_carol = alice.invite_to_group(&gid, carol.node_id).unwrap();
         carol.process_incoming(&wire(&to_carol)).unwrap();
 
-        gid
+        let from_carol = carol.create_group_chat_packet(&gid, "north gate").unwrap();
+        assert!(bob
+            .process_incoming(&wire(&from_carol))
+            .unwrap()
+            .plaintext
+            .is_none());
+    }
+
+    #[test]
+    fn alice_adds_bob_then_carol_and_bob_accepts_carols_messages() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        assert!(bob
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .unwrap()
+            .is_member(&carol.node_id));
+
+        let from_carol = carol.create_group_chat_packet(&gid, "north gate").unwrap();
+        for member in [&alice, &bob] {
+            assert_eq!(
+                member
+                    .process_incoming(&wire(&from_carol))
+                    .unwrap()
+                    .plaintext
+                    .as_deref(),
+                Some(&b"north gate"[..])
+            );
+        }
+    }
+
+    #[test]
+    fn adding_a_member_sends_the_update_to_every_member() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let dave = MeshNode::new();
+        handshake(&alice, &dave);
+
+        let update = alice.add_to_group(&gid, dave.node_id).unwrap();
+
+        let mut to: Vec<_> = update
+            .invites
+            .iter()
+            .map(|p| p.header.recipient_id)
+            .collect();
+        to.sort();
+        let mut expected = vec![bob.node_id, carol.node_id, dave.node_id];
+        expected.sort();
+        assert_eq!(to, expected);
+    }
+
+    #[test]
+    fn a_new_member_cannot_read_what_was_sent_before_they_joined() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let recorded = alice.create_group_chat_packet(&gid, "before dave").unwrap();
+
+        let dave = MeshNode::new();
+        handshake(&alice, &dave);
+        add_and_deliver(&alice, &gid, &dave, &[&bob, &carol, &dave]);
+
+        assert!(dave
+            .process_incoming(&wire(&recorded))
+            .unwrap()
+            .plaintext
+            .is_none());
+    }
+
+    #[test]
+    fn an_add_with_no_session_changes_nothing_for_the_group() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let epoch = alice.group_epoch_status(&gid).unwrap().epoch;
+
+        assert!(matches!(
+            alice.add_to_group(&gid, MeshNode::new().node_id),
+            Err(MeshError::NoSession)
+        ));
+        assert_eq!(alice.group_epoch_status(&gid).unwrap().epoch, epoch);
+    }
+
+    #[test]
+    fn adding_an_existing_member_resends_without_rotating() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let epoch = alice.group_epoch_status(&gid).unwrap().epoch;
+
+        let update = alice.add_to_group(&gid, bob.node_id).unwrap();
+
+        assert_eq!(alice.group_epoch_status(&gid).unwrap().epoch, epoch);
+        assert_eq!(update.invites.len(), 1);
+        assert_eq!(update.invites[0].header.recipient_id, bob.node_id);
+    }
+
+    #[test]
+    fn only_the_admin_can_add_or_read_epoch_status() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        assert!(matches!(
+            bob.add_to_group(&gid, MeshNode::new().node_id),
+            Err(MeshError::Crypto(CryptoError::NotGroupAdmin))
+        ));
+        assert!(matches!(
+            bob.group_epoch_status(&gid),
+            Err(MeshError::Crypto(CryptoError::NotGroupAdmin))
+        ));
+    }
+
+    #[test]
+    fn a_member_is_queued_until_their_own_signed_ack_arrives() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let update = alice.rekey_group(&gid).unwrap();
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::Queued);
+
+        let acks = deliver_invites(&update, &[&bob, &carol]);
+        assert_eq!(acks.len(), 2);
+        let epoch = alice.group_epoch_status(&gid).unwrap().epoch;
+        for ack in &acks {
+            let received = alice.process_incoming(&wire(ack)).unwrap();
+            let settled = received.group_epoch_ack.expect("an epoch ACK");
+            assert_eq!(settled.group_id, gid);
+            assert_eq!(settled.epoch, epoch);
+        }
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::Acknowledged);
+        assert_eq!(
+            state_of(&alice, &gid, &carol),
+            MemberEpochState::Acknowledged
+        );
+    }
+
+    #[test]
+    fn a_relay_cannot_forge_an_epoch_ack() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let update = alice.rekey_group(&gid).unwrap();
+        let invite = update
+            .invites
+            .iter()
+            .find(|p| p.header.recipient_id == bob.node_id)
+            .unwrap();
+
+        // The invite's packet id is visible to anyone relaying it.
+        let relay = MeshNode::new();
+        let forged = relay
+            .sign_packet(
+                PacketType::Ack,
+                MeshNode::random_msg_id(),
+                alice.node_id,
+                None,
+                0,
+                invite.header.msg_id.to_vec(),
+            )
+            .unwrap();
+
+        let received = alice.process_incoming(&wire(&forged)).unwrap();
+        assert!(received.group_epoch_ack.is_none());
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::Queued);
+    }
+
+    #[test]
+    fn an_invite_that_was_refused_is_not_acknowledged() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        // Bob holds a real pairwise session with Carol but is not the admin, so
+        // the invite he sends is authenticated and still has to be refused.
+        handshake(&bob, &carol);
+        let invite_bytes = {
+            let groups = bob.groups.lock().unwrap();
+            crypto::group::encode_invite(&groups.get(&gid).unwrap().to_invite()).unwrap()
+        };
+        let forged = bob
+            .sealed_invite_packet(carol.node_id, &invite_bytes)
+            .unwrap();
+
+        let received = carol.process_incoming(&wire(&forged)).unwrap();
+        assert!(received.group_event.is_none());
+        assert!(received.ack.is_none());
+    }
+
+    #[test]
+    fn a_member_with_no_session_is_reported_and_settled_by_a_resend() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        alice.sessions.lock().unwrap().drop_session(&bob.node_id);
+
+        let update = alice.rekey_group(&gid).unwrap();
+        assert_eq!(update.unreachable, vec![bob.node_id]);
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::NotSent);
+        assert_eq!(state_of(&alice, &gid, &carol), MemberEpochState::Queued);
+        for ack in deliver_invites(&update, &[&carol]) {
+            alice.process_incoming(&wire(&ack)).unwrap();
+        }
+
+        // The session comes back. Carol has confirmed, so only Bob is re-sent.
+        handshake(&alice, &bob);
+        let resend = alice.resend_group_updates(&gid).unwrap();
+        assert!(resend.unreachable.is_empty());
+        assert_eq!(resend.invites.len(), 1);
+        assert_eq!(resend.invites[0].header.recipient_id, bob.node_id);
+
+        let from_alice = alice.create_group_chat_packet(&gid, "back on").unwrap();
+        for ack in deliver_invites(&resend, &[&bob]) {
+            alice.process_incoming(&wire(&ack)).unwrap();
+        }
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::Acknowledged);
+        assert_eq!(
+            bob.process_incoming(&wire(&from_alice))
+                .unwrap()
+                .plaintext
+                .as_deref(),
+            Some(&b"back on"[..])
+        );
+    }
+
+    #[test]
+    fn a_second_copy_of_an_epoch_the_member_holds_is_still_acknowledged() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let first = alice.rekey_group(&gid).unwrap();
+        deliver_invites(&first, &[&bob, &carol]); // These ACKs are lost.
+
+        // The admin re-sends, and the copy is stale to a member who has it. Without
+        // an ACK here the admin could never learn that they do.
+        let second = alice.resend_group_updates(&gid).unwrap();
+        let acks = deliver_invites(&second, &[&bob, &carol]);
+        assert_eq!(acks.len(), 2);
+        for ack in &acks {
+            alice.process_incoming(&wire(ack)).unwrap();
+        }
+        assert_eq!(state_of(&alice, &gid, &bob), MemberEpochState::Acknowledged);
+    }
+
+    #[test]
+    fn remove_and_rotate_locks_out_a_seized_device_and_sends_it_nothing() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+
+        let update = alice.remove_from_group(&gid, &carol.node_id).unwrap();
+        assert!(update
+            .invites
+            .iter()
+            .all(|p| p.header.recipient_id != carol.node_id));
+        assert!(alice
+            .group_epoch_status(&gid)
+            .unwrap()
+            .members
+            .iter()
+            .all(|m| m.member != carol.node_id));
+        deliver_invites(&update, &[&bob]);
+
+        let packet = alice.create_group_chat_packet(&gid, "moved").unwrap();
+        assert!(carol
+            .process_incoming(&wire(&packet))
+            .unwrap()
+            .plaintext
+            .is_none());
+        assert_eq!(
+            bob.process_incoming(&wire(&packet))
+                .unwrap()
+                .plaintext
+                .as_deref(),
+            Some(&b"moved"[..])
+        );
+    }
+
+    #[test]
+    fn a_plain_rekey_still_hands_the_key_to_every_listed_member() {
+        // Why rekeying is not the recovery workflow (REVIEW H6).
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let update = alice.rekey_group(&gid).unwrap();
+        assert!(update
+            .invites
+            .iter()
+            .any(|p| p.header.recipient_id == carol.node_id));
+    }
+
+    #[test]
+    fn epoch_acks_survive_a_restart_of_the_admin() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let update = alice.rekey_group(&gid).unwrap();
+        let acks = deliver_invites(&update, &[&bob, &carol]);
+
+        let restored = restart(&alice, &[21u8; 32]);
+        assert_eq!(state_of(&restored, &gid, &bob), MemberEpochState::Queued);
+        for ack in &acks {
+            restored.process_incoming(&wire(ack)).unwrap();
+        }
+        assert_eq!(
+            state_of(&restored, &gid, &bob),
+            MemberEpochState::Acknowledged
+        );
+    }
+
+    #[test]
+    fn a_blob_from_before_epoch_acks_still_opens() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        let gid = affinity_group(&alice, &bob, &carol);
+        let key = [22u8; 32];
+
+        let old_format = {
+            let sessions = alice.sessions.lock().unwrap();
+            let groups = alice.groups.lock().unwrap();
+            let trust = alice.trust.lock().unwrap();
+            let state = SecureStateOut {
+                sessions: sessions.sessions_for_export(),
+                groups: &groups,
+                trust: &trust,
+            };
+            crypto::vault::seal(&key, &bincode::serialize(&state).unwrap()).unwrap()
+        };
+
+        let restored = MeshNode::from_secret_key(&alice.secret_key_bytes());
+        restored.import_secure_state(&key, &old_format).unwrap();
+        assert_eq!(state_of(&restored, &gid, &bob), MemberEpochState::NotSent);
+        assert_eq!(
+            restored.resend_group_updates(&gid).unwrap().invites.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_wipe_forgets_epoch_acks() {
+        let (alice, bob, carol) = (MeshNode::new(), MeshNode::new(), MeshNode::new());
+        affinity_group(&alice, &bob, &carol);
+        assert!(!alice.group_epoch_acks.lock().unwrap().is_empty());
+        alice.wipe_secure_state();
+        assert!(alice.group_epoch_acks.lock().unwrap().is_empty());
     }
 
     #[test]
