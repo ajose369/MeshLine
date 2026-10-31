@@ -244,20 +244,23 @@ class BleRetryTest {
         val manager = BleTransportManager(context)
         val p0 = dummyPacket(1, 50)
         var timedOut = false
+        val timeoutRunnable = Runnable { timedOut = true }
+        manager.timeoutHandler.postDelayed(timeoutRunnable, 1000)
         val state = BleTransportManager.WriteQueueState(
             packets = listOf(p0),
             frames = listOf(BleTransportManager.Frame(0, p0)),
             submittedIndex = 0,
             acknowledgedIndex = -1,
             characteristic = characteristic,
-            timeoutRunnable = Runnable { timedOut = true }
+            timeoutRunnable = timeoutRunnable
         )
 
         manager.writeStates[testAddress] = state
         manager.requeueUnsent(testAddress)
 
         assertNull("Timeout runnable reference should be cleared", state.timeoutRunnable)
-        assertEquals(false, timedOut)
+        org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+        assertEquals("Posted timeout runnable must not execute after requeue cancel", false, timedOut)
     }
 
     private fun createGatt(manager: BleTransportManager): BluetoothGatt {
@@ -273,6 +276,8 @@ class BleRetryTest {
     @Test
     fun `rejected write immediately requeues packet and disconnects`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
         manager.writeCharacteristicInvoker = { _, _, _ -> false }
         val gatt = createGatt(manager)
 
@@ -292,11 +297,14 @@ class BleRetryTest {
         val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
         assertEquals(1, requeued.size)
         assertArrayEquals(p0, requeued[0])
+        assertEquals("Disconnect must be called on rejected write", 1, disconnectCalls)
     }
 
     @Test
     fun `write deadline expiry requeues packet and disconnects`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
         manager.writeCharacteristicInvoker = { _, _, _ -> true }
         val gatt = createGatt(manager)
 
@@ -314,6 +322,7 @@ class BleRetryTest {
 
         assertEquals("Frame 0 must be submitted", 0, state.submittedIndex)
         assertNotNull("Write state should remain pending before timeout", manager.writeStates[testAddress])
+        assertEquals(0, disconnectCalls)
 
         // Advance the looper past the write timeout
         org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
@@ -322,11 +331,14 @@ class BleRetryTest {
         val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
         assertEquals(1, requeued.size)
         assertArrayEquals(p0, requeued[0])
+        assertEquals("Disconnect must be called on write deadline expiry", 1, disconnectCalls)
     }
 
     @Test
     fun `success callback advances exactly one frame until queue finishes`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
         manager.writeCharacteristicInvoker = { _, _, _ -> true }
         val gatt = createGatt(manager)
 
@@ -356,12 +368,14 @@ class BleRetryTest {
         assertEquals("First frame acknowledged", 0, state.acknowledgedIndex)
         assertEquals("Second frame submitted", 1, state.submittedIndex)
         assertNotNull("State still active", manager.writeStates[testAddress])
+        assertEquals(0, disconnectCalls)
 
         // Frame 1 completes successfully
         manager.gattClientCallback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_SUCCESS)
 
         assertEquals("Second frame acknowledged", 1, state.acknowledgedIndex)
         assertNull("Queue should be removed upon full completion", manager.writeStates[testAddress])
+        assertEquals("Disconnect must be called upon full completion", 1, disconnectCalls)
 
         val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
         assertTrue("No packets should be requeued after clean completion", requeued.isEmpty())
@@ -370,6 +384,8 @@ class BleRetryTest {
     @Test
     fun `failure callback requeues packet and disconnects`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
         manager.writeCharacteristicInvoker = { _, _, _ -> true }
         val gatt = createGatt(manager)
 
@@ -386,6 +402,7 @@ class BleRetryTest {
         manager.sendNextFrame(gatt, state)
 
         assertEquals(0, state.submittedIndex)
+        assertEquals(0, disconnectCalls)
 
         // Write callback returns failure
         manager.gattClientCallback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_FAILURE)
@@ -394,13 +411,19 @@ class BleRetryTest {
         val requeued = StoreAndForwardManager.getInstance(context).drainOutbound()
         assertEquals(1, requeued.size)
         assertArrayEquals(p0, requeued[0])
+        assertEquals("Disconnect must be called on write failure callback", 1, disconnectCalls)
     }
 
     @Test
     fun `service discovery deadline expiry cleans up connectedDevices and closes gatt`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        var closeCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
+        manager.closeInvoker = { closeCalls++ }
         val gatt = createGatt(manager)
 
+        manager.peerCount.set(1)
         manager.connectedDevices.add(testAddress)
         manager.scheduleDiscoveryTimeout(gatt, testAddress)
 
@@ -412,11 +435,16 @@ class BleRetryTest {
 
         assertTrue("Connected devices must not retain timed out address", !manager.connectedDevices.contains(testAddress))
         assertTrue("Discovery timeouts map must clear timed out address", !manager.discoveryTimeouts.containsKey(testAddress))
+        assertEquals("Peer count must decrement on discovery timeout", 0, manager.activePeersCount)
+        assertEquals("Disconnect must be called on discovery deadline", 1, disconnectCalls)
+        assertEquals("Close must be called on discovery deadline", 1, closeCalls)
     }
 
     @Test
     fun `service discovery rejection cleans up connectedDevices and disconnects`() {
         val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
         val gatt = createGatt(manager)
 
         manager.connectedDevices.add(testAddress)
@@ -425,6 +453,66 @@ class BleRetryTest {
         val ok = manager.discoverServicesQuietly(gatt)
         assertEquals(false, ok)
         assertTrue("Connected devices must be cleared when discoverServices fails", !manager.connectedDevices.contains(testAddress))
+        assertEquals("Disconnect must be called when discoverServices fails", 1, disconnectCalls)
+    }
+
+    @Test
+    fun `connect flow schedules discovery deadline, expiring it decrements activePeersCount and closes gatt`() {
+        val manager = BleTransportManager(context)
+        var disconnectCalls = 0
+        var closeCalls = 0
+        manager.disconnectInvoker = { disconnectCalls++ }
+        manager.closeInvoker = { closeCalls++ }
+        manager.discoverServicesInvoker = { true }
+        val gatt = createGatt(manager)
+
+        // Connect fires STATE_CONNECTED
+        manager.gattClientCallback.onConnectionStateChange(
+            gatt,
+            BluetoothGatt.GATT_SUCCESS,
+            android.bluetooth.BluetoothProfile.STATE_CONNECTED
+        )
+
+        assertEquals("Peer count must increment on connect", 1, manager.activePeersCount)
+        assertTrue("Discovery deadline must be scheduled", manager.discoveryTimeouts.containsKey(testAddress))
+        assertEquals(0, disconnectCalls)
+        assertEquals(0, closeCalls)
+
+        // Advance looper past discovery deadline (e.g. 10s)
+        org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+
+        assertEquals("Active peers count must decrement to 0 on discovery timeout", 0, manager.activePeersCount)
+        assertTrue("Discovery timeout map must be cleared", !manager.discoveryTimeouts.containsKey(testAddress))
+        assertTrue("Connected devices must be cleared", !manager.connectedDevices.contains(testAddress))
+        assertEquals("Disconnect must be called on discovery timeout", 1, disconnectCalls)
+        assertEquals("Close must be called on discovery timeout", 1, closeCalls)
+    }
+
+    @Test
+    fun `healthy discovery cancels discovery deadline so expiring looper does not close gatt`() {
+        val manager = BleTransportManager(context)
+        var closeCalls = 0
+        manager.closeInvoker = { closeCalls++ }
+        manager.discoverServicesInvoker = { true }
+        val gatt = createGatt(manager)
+
+        // Connect fires STATE_CONNECTED
+        manager.gattClientCallback.onConnectionStateChange(
+            gatt,
+            BluetoothGatt.GATT_SUCCESS,
+            android.bluetooth.BluetoothProfile.STATE_CONNECTED
+        )
+        assertTrue("Discovery deadline scheduled", manager.discoveryTimeouts.containsKey(testAddress))
+
+        // Complete discovery successfully
+        manager.gattClientCallback.onServicesDiscovered(gatt, BluetoothGatt.GATT_SUCCESS)
+
+        assertTrue("Discovery deadline must be cancelled on services discovered", !manager.discoveryTimeouts.containsKey(testAddress))
+
+        // Advance looper past discovery deadline
+        org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+
+        assertEquals("Close must NOT be called when discovery was healthy", 0, closeCalls)
     }
 
     @Test

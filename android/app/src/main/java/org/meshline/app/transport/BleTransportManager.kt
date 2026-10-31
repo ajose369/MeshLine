@@ -149,11 +149,27 @@ class BleTransportManager(private val context: Context) {
         return gatt.discoverServices()
     }
 
+    @SuppressLint("MissingPermission")
+    private fun defaultDisconnect(gatt: BluetoothGatt) {
+        gatt.disconnect()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun defaultClose(gatt: BluetoothGatt) {
+        gatt.close()
+    }
+
     internal var writeCharacteristicInvoker: (gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) -> Boolean =
         ::defaultWriteCharacteristic
 
     internal var discoverServicesInvoker: (gatt: BluetoothGatt) -> Boolean =
         ::defaultDiscoverServices
+
+    internal var disconnectInvoker: (gatt: BluetoothGatt) -> Unit =
+        ::defaultDisconnect
+
+    internal var closeInvoker: (gatt: BluetoothGatt) -> Unit =
+        ::defaultClose
 
     /** Negotiated ATT MTU per peer, until one is agreed. */
     private val negotiatedMtu = ConcurrentHashMap<String, Int>()
@@ -541,6 +557,7 @@ class BleTransportManager(private val context: Context) {
         val runnable = Runnable {
             Log.w(TAG, "Service discovery timed out after ${discoveryTimeoutMs}ms for $address; disconnecting.")
             discoveryTimeouts.remove(address)
+            peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
             connectedDevices.remove(address)
             negotiatedMtu.remove(address)
             disconnectQuietly(gatt)
@@ -786,7 +803,7 @@ class BleTransportManager(private val context: Context) {
 
     private fun disconnectQuietly(gatt: BluetoothGatt) {
         try {
-            gatt.disconnect()
+            disconnectInvoker(gatt)
         } catch (e: SecurityException) {
             Log.w(TAG, "Disconnect permission revoked.", e)
         }
@@ -794,7 +811,7 @@ class BleTransportManager(private val context: Context) {
 
     private fun closeQuietly(gatt: BluetoothGatt) {
         try {
-            gatt.close()
+            closeInvoker(gatt)
         } catch (e: SecurityException) {
             Log.w(TAG, "Close permission revoked.", e)
         }
