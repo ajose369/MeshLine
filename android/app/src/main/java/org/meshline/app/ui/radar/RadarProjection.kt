@@ -71,15 +71,55 @@ object RadarProjection {
         return peers.filter { it.isDirect && it.rssiDbm != null }
     }
 
+    data class HopClassification(
+        val reachability: PeerReachability,
+        val rssiDbm: Int?,
+        val hopCount: Int?
+    ) {
+        val isDirect: Boolean get() = reachability == PeerReachability.DIRECT
+    }
+
+    /**
+     * Pure classification of transport hop evidence (H13 fail-closed).
+     *
+     * Rules:
+     * - Direct evidence requires core to explicitly confirm `hopsOnArrival == 0`,
+     *   `!isDuplicate`, and a physical `directLinkRssi != null`.
+     * - If `hopsOnArrival` is absent (null): fails closed to RELAYED, null RSSI, null hopCount.
+     * - If duplicate or `hopsOnArrival > 0` or missing RSSI: RELAYED, null RSSI, hopCount.
+     */
+    fun classifyHopObservation(
+        hopsOnArrival: Int?,
+        isDuplicate: Boolean,
+        directLinkRssi: Int?
+    ): HopClassification {
+        val isDirect = hopsOnArrival == 0 && !isDuplicate && directLinkRssi != null
+        return if (isDirect) {
+            HopClassification(
+                reachability = PeerReachability.DIRECT,
+                rssiDbm = directLinkRssi,
+                hopCount = 0
+            )
+        } else {
+            HopClassification(
+                reachability = PeerReachability.RELAYED,
+                rssiDbm = null,
+                hopCount = hopsOnArrival
+            )
+        }
+    }
+
     /**
      * Pure merge logic combining a new observation with existing peer state.
      *
      * Rules:
      * 1. Direct observations (reachability == DIRECT && rssiDbm != null) set reachability to DIRECT,
      *    capture the RSSI measurement, and record [nowMillis] in `lastDirectMillis`.
-     * 2. Relayed observations update `lastSeenMillis`. If the peer was previously direct, it drops
-     *    to RELAYED with null RSSI if `directExpiryMillis` has elapsed OR if the observation
-     *    explicitly traveled multi-hop (`hopCount > 1`).
+     * 2. Relayed observations update `lastSeenMillis`. If the peer was previously direct, direct
+     *    evidence is preserved until `directExpiryMillis` (30s) elapses. A flood echo arriving
+     *    through a relay does NOT knock a direct neighbour off the radar.
+     * 3. Once `directExpiryMillis` elapses without fresh direct evidence, the peer drops to
+     *    RELAYED with null RSSI, null `lastDirectMillis`, and null `hopCount`.
      */
     fun mergePeerObservation(
         existing: PeerNodeEntity?,
@@ -100,24 +140,23 @@ object RadarProjection {
             effectiveReachability = PeerReachability.DIRECT
             effectiveRssi = observation.rssiDbm
             effectiveLastDirect = nowMillis
-            effectiveHops = 1
+            effectiveHops = observation.hopCount ?: 0
         } else {
-            // Relayed observation: retain direct status only if recently seen direct AND this packet is not multi-hop
+            // Relayed observation: retain direct status if within directExpiryMillis window
             val hasRecentDirect = existing?.reachability == PeerReachability.DIRECT &&
                 existing.lastDirectMillis != null &&
-                (nowMillis - existing.lastDirectMillis <= directExpiryMillis) &&
-                (observation.hopCount == null || observation.hopCount <= 1)
+                (nowMillis - existing.lastDirectMillis <= directExpiryMillis)
 
             if (hasRecentDirect) {
                 effectiveReachability = PeerReachability.DIRECT
                 effectiveRssi = existing?.rssiDbm
                 effectiveLastDirect = existing?.lastDirectMillis
-                effectiveHops = 1
+                effectiveHops = existing?.hopCount ?: 0
             } else {
                 effectiveReachability = PeerReachability.RELAYED
                 effectiveRssi = null
                 effectiveLastDirect = null
-                effectiveHops = observation.hopCount ?: existing?.hopCount
+                effectiveHops = observation.hopCount
             }
         }
 
@@ -149,7 +188,8 @@ object RadarProjection {
             return peer.copy(
                 reachability = PeerReachability.RELAYED,
                 rssiDbm = null,
-                lastDirectMillis = null
+                lastDirectMillis = null,
+                hopCount = null
             )
         }
         return peer

@@ -434,30 +434,23 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
             obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
 
-            // Check additive fields if provided (B-RFC-001)
-            val hopsOnArrival = obj.optInt("hops_on_arrival", -1)
+            // Classify transport hop evidence fail-closed (B-RFC-001, REVIEW H13).
+            // Without explicit core confirmation via hops_on_arrival == 0, no packet
+            // is treated as direct.
+            val hopsOnArrival = if (obj.has("hops_on_arrival")) obj.getInt("hops_on_arrival") else null
             val isDuplicate = obj.optBoolean("is_duplicate", false)
-            val hops = if (hopsOnArrival >= 0) {
-                hopsOnArrival
-            } else if (isDuplicate) {
-                // Duplicates in flood routing retain raw wire TTL, so a 1-relay duplicate
-                // has wire ttl=7. A duplicate via a relay must never be treated as direct.
-                2
-            } else {
-                // Note: TTL is excluded from wire packet signature (schema.rs), so a low
-                // hop count is physical transport evidence, not cryptographic proximity proof.
-                (8 - ttl).coerceAtLeast(1)
-            }
-            val isDirect = hops <= 1 && directLinkRssi != null && !isDuplicate
-            val reachability = if (isDirect) PeerReachability.DIRECT else PeerReachability.RELAYED
-            val rssi = if (isDirect) directLinkRssi else null
+            val classification = RadarProjection.classifyHopObservation(
+                hopsOnArrival = hopsOnArrival,
+                isDuplicate = isDuplicate,
+                directLinkRssi = directLinkRssi
+            )
 
             observePeer(
                 nodeId = senderId,
                 transport = transport,
-                rssiDbm = rssi,
-                reachability = reachability,
-                hopCount = hops
+                rssiDbm = classification.rssiDbm,
+                reachability = classification.reachability,
+                hopCount = classification.hopCount
             )
 
             when (packetType) {

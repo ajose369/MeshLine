@@ -307,7 +307,7 @@ private fun RadarFace(
             if (relayedCount > 0) {
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "+$relayedCount relayed via mesh",
+                    text = "+$relayedCount heard recently",
                     style = MaterialTheme.typography.labelSmall,
                     fontSize = 9.sp,
                     color = NeonCyan
@@ -349,8 +349,12 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
                 append(" · ${peer.rssiDbm} dBm")
             }
         } else {
-            val hops = peer.hopCount ?: 1
-            append(" · mesh relayed ($hops ${if (hops == 1) "hop" else "hops"}) · unknown signal")
+            if (peer.hopCount != null && peer.hopCount > 0) {
+                val hops = peer.hopCount
+                append(" · mesh relayed ($hops ${if (hops == 1) "hop" else "hops"}) · unknown signal")
+            } else {
+                append(" · route unknown · unknown signal")
+            }
         }
         append(" · heard ${secondsAgo}s ago")
     }

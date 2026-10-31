@@ -25,20 +25,24 @@ In `ReceiveResultJson` returned by `process_incoming` in `crates/meshline-ffi/sr
 Add additive fields:
 ```json
 {
-  "hops_on_arrival": 1,
-  "is_duplicate": false,
-  "wire_ttl": 8
+  "hops_on_arrival": 0,
+  "is_duplicate": false
 }
 ```
-Or at minimum `hops_on_arrival: u8` (the number of hops the packet traversed to reach this node, calculated on wire TTL before decrement, e.g. `DEFAULT_TTL - wire_ttl`), and `is_duplicate: bool`.
-Having `hops_on_arrival` directly computed in the core prevents Android from hard-coding `DEFAULT_TTL = 8`.
+Where:
+- `hops_on_arrival: u8 = DEFAULT_TTL.saturating_sub(wire_ttl)` read before flood dedup:
+  - `0` = direct link (no intermediate relays)
+  - `1` = one intermediate relay
+  - same meaning on both initial deliveries and duplicates
+- `is_duplicate: bool` indicating whether this packet hash was previously seen in the dedup cache.
+
+Direct link classification in Kotlin:
+`hopsOnArrival == 0 && !isDuplicate && directLinkRssi != null`
 
 ## Meanwhile
-In `StoreAndForwardManager.kt`:
-Check `obj.optInt("hops_on_arrival", -1)`. If present (>= 0), use it directly.
-If absent:
-- If `obj.optBoolean("is_duplicate", false)` is true, do not treat as direct (hops >= 2, reachability = RELAYED).
-- Otherwise fallback to `(8 - ttl).coerceAtLeast(1)`.
+In `StoreAndForwardManager.kt` and `RadarProjection.classifyHopObservation`:
+Fail closed! If `hops_on_arrival` is absent (null), the packet is classified as `RELAYED` with `rssiDbm = null` and `hopCount = null`. No TTL fallback. Until Lane A's core PR lands, the radar face honestly remains empty rather than plotting distant origins.
 
 ## Resolution
 <!-- Requester fills in: link to the other lane's PR / handoff entry, then set status: done -->
+Accepted by Lane A in PR #9 review comment (2026-10-31); Lane A will implement in dedicated core PR.

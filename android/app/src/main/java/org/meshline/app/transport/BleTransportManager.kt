@@ -556,6 +556,7 @@ class BleTransportManager(private val context: Context) {
 
         override fun onStartFailure(errorCode: Int) {
             Log.w(TAG, "Advertising failed with code $errorCode.")
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
             lastError = when (errorCode) {
                 ADVERTISE_FAILED_FEATURE_UNSUPPORTED ->
                     "This device cannot advertise over Bluetooth LE."
@@ -574,7 +575,7 @@ class BleTransportManager(private val context: Context) {
             } catch (e: SecurityException) {
                 return
             }
-            result.let { deviceRssi[address] = it.rssi }
+            deviceRssi[address] = result.rssi
             if (connectedDevices.add(address)) {
                 connectToPeer(device)
             }
