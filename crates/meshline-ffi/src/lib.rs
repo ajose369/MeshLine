@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use meshline_core::{
     node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag, MeshNode,
-    PacketType, ResourcePinType,
+    Packet, PacketType, ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -338,6 +338,34 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeBeginHa
         match packet {
             Ok(bytes) => byte_array_out(&mut env, &bytes),
             Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+fn packet_id_hex(raw: &[u8]) -> Option<String> {
+    Packet::from_bytes(raw)
+        .ok()
+        .map(|p| to_hex(&p.header.msg_id))
+}
+
+/// The canonical id of a packet this device just built, as hex. History and the
+/// outbox key on it so a later ACK can find the message. Does not verify the
+/// signature, so it says nothing about a packet that came from the radio; those
+/// get their id from `nativeProcessIncoming`.
+#[no_mangle]
+pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativePacketId(
+    mut env: JNIEnv,
+    _class: JClass,
+    raw_packet: JByteArray,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let bytes = match env.convert_byte_array(&raw_packet) {
+            Ok(b) => b,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match packet_id_hex(&bytes) {
+            Some(id) => string_out(&mut env, &id),
+            None => std::ptr::null_mut(),
         }
     })
 }
@@ -768,6 +796,9 @@ struct ReceiveResultJson {
     relay_packet_hex: Option<String>,
     /// Hex of an ACK to transmit back to the sender.
     ack_packet_hex: Option<String>,
+    /// The message of ours this ACK confirms, when it was signed by the node that
+    /// message went to. Mark this delivered; `msg_id` is the ACK packet's own id.
+    acked_message_id: Option<String>,
     /// Hex of the next handshake message to transmit back.
     handshake_reply_hex: Option<String>,
     /// Decrypted text: private chat addressed to us, or a group message this
@@ -856,6 +887,7 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeProcess
                 .as_ref()
                 .and_then(|p| p.to_bytes().ok())
                 .map(|b| to_hex(&b)),
+            acked_message_id: outcome.acked_message_id.as_ref().map(|m| to_hex(m)),
             handshake_reply_hex: outcome
                 .handshake_reply
                 .as_ref()
@@ -974,6 +1006,22 @@ mod tests {
         assert!(node_id_from_hex(&"ab".repeat(16)).is_some());
         assert!(node_id_from_hex(&"ab".repeat(15)).is_none());
         assert!(node_id_from_hex(&"ab".repeat(17)).is_none());
+    }
+
+    #[test]
+    fn a_created_packet_reports_the_id_it_carries() {
+        let node = MeshNode::new();
+        let sos = node.create_public_sos("help", None).unwrap();
+        assert_eq!(
+            packet_id_hex(&sos.to_bytes().unwrap()),
+            Some(to_hex(&sos.header.msg_id))
+        );
+    }
+
+    #[test]
+    fn garbage_has_no_packet_id() {
+        assert_eq!(packet_id_hex(&[]), None);
+        assert_eq!(packet_id_hex(&[0xA5; 64]), None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use meshline_core::{BatteryPowerState, LocationTag, MeshNode};
+use meshline_core::{BatteryPowerState, LocationTag, MeshNode, ReceiveOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 struct MeshSimulator {
@@ -172,6 +172,86 @@ impl MeshSimulator {
         }
         (accepted, rejected)
     }
+
+    /// Floods a packet from `from` and returns what `to` made of it, as a real
+    /// multi-hop delivery rather than a direct hand-off.
+    fn deliver(&self, from: usize, to: usize, raw: Vec<u8>) -> Option<ReceiveOutcome> {
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::from([from]);
+        let mut result = None;
+        queue.push_back((from, raw));
+        while let Some((curr, bytes)) = queue.pop_front() {
+            for &next in self.adjacency.get(&curr).into_iter().flatten() {
+                if !visited.insert(next) {
+                    continue;
+                }
+                let Ok(outcome) = self.nodes[next].process_incoming(&bytes) else {
+                    continue;
+                };
+                if outcome.should_relay {
+                    if let Ok(onward) = outcome.packet.to_bytes() {
+                        queue.push_back((next, onward));
+                    }
+                }
+                if next == to {
+                    result = Some(outcome);
+                }
+            }
+        }
+        result
+    }
+
+    /// Runs a chat across the mesh and checks what comes back: the ACK must name
+    /// the original message, and a chat the recipient cannot read must get none.
+    fn run_ack_simulation(&self, a: usize, b: usize) -> Result<(), String> {
+        let (alice, bob) = (&self.nodes[a], &self.nodes[b]);
+
+        let mut msg = alice
+            .begin_handshake(bob.node_id)
+            .map_err(|e| e.to_string())?;
+        let mut sender = a;
+        while let Some(reply) = self
+            .deliver(
+                sender,
+                if sender == a { b } else { a },
+                msg.to_bytes().map_err(|e| e.to_string())?,
+            )
+            .ok_or("a handshake message did not arrive")?
+            .handshake_reply
+        {
+            msg = reply;
+            sender = if sender == a { b } else { a };
+        }
+
+        let chat = alice
+            .create_chat_packet(bob.node_id, "are you safe?")
+            .map_err(|e| e.to_string())?;
+        let received = self
+            .deliver(a, b, chat.to_bytes().map_err(|e| e.to_string())?)
+            .ok_or("the chat did not arrive")?;
+        let ack = received.ack.ok_or("a decrypted chat got no ACK")?;
+        let settled = self
+            .deliver(b, a, ack.to_bytes().map_err(|e| e.to_string())?)
+            .ok_or("the ACK did not arrive")?;
+        if settled.acked_message_id != Some(chat.header.msg_id) {
+            return Err("the ACK did not settle the original message".into());
+        }
+
+        let unreadable = alice
+            .create_chat_packet(bob.node_id, "after reinstall")
+            .map_err(|e| e.to_string())?;
+        bob.sessions
+            .lock()
+            .map_err(|e| e.to_string())?
+            .drop_session(&alice.node_id);
+        let received = self
+            .deliver(a, b, unreadable.to_bytes().map_err(|e| e.to_string())?)
+            .ok_or("the second chat did not arrive")?;
+        if received.ack.is_some() {
+            return Err("a chat that could not be decrypted was acknowledged".into());
+        }
+        Ok(())
+    }
 }
 
 fn main() {
@@ -247,6 +327,17 @@ fn main() {
     println!("Forged packets accepted: {accepted}");
     println!("Forged packets rejected: {rejected}");
 
+    // Scenario 5: "delivered" has to survive the trip back across the mesh, and
+    // relays must always forward here so the result is about ACKs, not dampening.
+    println!("\n--- SCENARIO 5: Chat and ACK across 4 hops ---");
+    let mut ack_net = MeshSimulator::new_grid(3);
+    ack_net.set_battery_state_all(BatteryPowerState::Charging);
+    let ack_result = ack_net.run_ack_simulation(0, 8);
+    println!(
+        "ACK settles the original message, unreadable chat gets none: {}",
+        ack_result.is_ok()
+    );
+
     // These are the properties the mesh is supposed to guarantee. Assert them
     // rather than printing a banner that says "PASSED" regardless of outcome.
     let mut failures = Vec::new();
@@ -265,6 +356,9 @@ fn main() {
     }
     if accepted > 0 {
         failures.push(format!("{accepted} nodes accepted a forged SOS"));
+    }
+    if let Err(reason) = ack_result {
+        failures.push(format!("ACK scenario: {reason}"));
     }
 
     println!("\n============================================================");

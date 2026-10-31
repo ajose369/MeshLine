@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+pub mod delivery;
 pub mod gis;
 pub mod packet;
 pub mod routing;
 pub mod security;
 pub mod transport;
 
+use bincode::Options;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::Rng;
@@ -21,6 +23,7 @@ pub use crypto::noise::{HandshakeSession, IdentityProof, SessionManager};
 pub use crypto::session::TransportSession;
 pub use crypto::trust::{safety_number, safety_number_groups, TrustStore, VerificationRecord};
 pub use crypto::CryptoError;
+pub use delivery::{PendingAcks, MAX_PENDING_ACKS};
 pub use gis::pins::{GisPinStore, PinError, ResourcePin, ResourcePinType};
 pub use packet::schema::{
     node_id_from_pubkey, LocationTag, Packet, PacketError, PacketHeader, PacketType,
@@ -85,8 +88,13 @@ pub struct ReceiveOutcome {
     pub packet: Packet,
     /// True when this node should rebroadcast it.
     pub should_relay: bool,
-    /// Set when the packet was addressed to us and warrants an ACK.
+    /// An ACK to send back. Only ever set for a chat this node decrypted, because
+    /// that is the fact an ACK reports; relaying or merely receiving is not.
     pub ack: Option<Packet>,
+    /// The message of ours this ACK settles. Set only when the ACK was signed by
+    /// the node that message was sent to. This, never `packet.header.msg_id`, is
+    /// the id to mark delivered: that one is the ACK packet's own.
+    pub acked_message_id: Option<[u8; 16]>,
     /// Next Noise handshake message to send back, when the exchange calls for
     /// one. Produced here rather than by a second call, because a handshake
     /// message may only be consumed once.
@@ -115,6 +123,7 @@ pub struct MeshNode {
     pub sessions: Arc<Mutex<SessionManager>>,
     pub groups: Arc<Mutex<GroupStore>>,
     pub trust: Arc<Mutex<TrustStore>>,
+    pending_acks: Mutex<PendingAcks>,
 }
 
 /// The secure state as it is written to the vault.
@@ -165,6 +174,7 @@ impl MeshNode {
             sessions: Arc::new(Mutex::new(SessionManager::new())),
             groups: Arc::new(Mutex::new(GroupStore::new())),
             trust: Arc::new(Mutex::new(TrustStore::new())),
+            pending_acks: Mutex::new(PendingAcks::default()),
         }
     }
 
@@ -334,14 +344,19 @@ impl MeshNode {
                 })?
         };
 
-        self.sign_packet(
+        let packet = self.sign_packet(
             PacketType::Chat,
             Self::random_msg_id(),
             recipient_id,
             None,
             0,
             ciphertext,
-        )
+        )?;
+        self.pending_acks
+            .lock()
+            .expect("pending ack mutex poisoned")
+            .record(packet.header.msg_id, recipient_id, packet.header.timestamp);
+        Ok(packet)
     }
 
     /// Starts a Noise-XX handshake with a peer, returning the packet to send.
@@ -567,6 +582,10 @@ impl MeshNode {
     /// The key belongs in platform-protected storage. Everything in here is
     /// live key material, which is exactly what makes a seized device dangerous
     /// to the rest of the mesh.
+    ///
+    /// The pending ACK table follows the state as a second value rather than a new
+    /// field, so a blob from before it existed still opens and a build that does
+    /// not know about it ignores it.
     pub fn export_secure_state(&self, vault_key: &[u8; 32]) -> Result<Vec<u8>, MeshError> {
         let sessions = self.sessions.lock().expect("session mutex poisoned");
         let groups = self.groups.lock().expect("group mutex poisoned");
@@ -577,8 +596,15 @@ impl MeshNode {
             groups: &groups,
             trust: &trust,
         };
-        let plaintext =
+        let mut plaintext =
             bincode::serialize(&state).map_err(|e| MeshError::Serialization(e.to_string()))?;
+        let pending = self
+            .pending_acks
+            .lock()
+            .expect("pending ack mutex poisoned");
+        plaintext.extend(
+            bincode::serialize(&*pending).map_err(|e| MeshError::Serialization(e.to_string()))?,
+        );
 
         Ok(crypto::vault::seal(vault_key, &plaintext)?)
     }
@@ -589,8 +615,18 @@ impl MeshNode {
     /// with half a session table: the caller starts fresh and re-handshakes.
     pub fn import_secure_state(&self, vault_key: &[u8; 32], blob: &[u8]) -> Result<(), MeshError> {
         let plaintext = crypto::vault::open(vault_key, blob)?;
-        let state: SecureStateIn = bincode::deserialize(&plaintext)
+        let mut decoder = bincode::de::Deserializer::from_slice(
+            &plaintext,
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes(),
+        );
+        let state = SecureStateIn::deserialize(&mut decoder)
             .map_err(|e| MeshError::Serialization(e.to_string()))?;
+        // Absent from older blobs. The AEAD already vouched for these bytes, so
+        // running out of them can only mean that, and the messages concerned stay
+        // "sent" rather than being called delivered on no evidence.
+        let pending = PendingAcks::deserialize(&mut decoder).unwrap_or_default();
 
         self.sessions
             .lock()
@@ -598,6 +634,10 @@ impl MeshNode {
             .install_sessions(state.sessions);
         *self.groups.lock().expect("group mutex poisoned") = state.groups;
         *self.trust.lock().expect("trust mutex poisoned") = state.trust;
+        *self
+            .pending_acks
+            .lock()
+            .expect("pending ack mutex poisoned") = pending;
         Ok(())
     }
 
@@ -613,6 +653,11 @@ impl MeshNode {
             .clear();
         self.groups.lock().expect("group mutex poisoned").clear();
         *self.trust.lock().expect("trust mutex poisoned") = TrustStore::new();
+        // Who this device has been writing to is exactly what a wipe must remove.
+        self.pending_acks
+            .lock()
+            .expect("pending ack mutex poisoned")
+            .clear();
     }
 
     /// Validates and processes an inbound frame from any transport.
@@ -655,6 +700,7 @@ impl MeshNode {
         let mut group_id = None;
         let mut group_name = None;
         let mut group_event = None;
+        let mut acked_message_id = None;
         if !is_duplicate {
             match packet.header.packet_type {
                 PacketType::ResourcePin => {
@@ -709,6 +755,15 @@ impl MeshNode {
                         .decrypt_from(&packet.header.sender_id, &packet.payload)
                         .ok();
                 }
+                PacketType::Ack if addressed_to_us => {
+                    // sender_id was bound to the signing key in step 1, so this
+                    // compares the original recipient with who really signed.
+                    acked_message_id = self
+                        .pending_acks
+                        .lock()
+                        .expect("pending ack mutex poisoned")
+                        .accept(&packet.header.sender_id, &packet.payload);
+                }
                 PacketType::GroupInvite if addressed_to_us => {
                     // An invite only means anything inside an authenticated
                     // pairwise session, so it is opened there first and the
@@ -756,11 +811,11 @@ impl MeshNode {
             }
         }
 
-        let ack = if addressed_to_us && !is_duplicate {
-            match packet.header.packet_type {
-                PacketType::Chat | PacketType::PrivateSos => Some(self.create_ack(&packet)?),
-                _ => None,
-            }
+        // Plaintext only exists here if this delivery decrypted, so a duplicate, a
+        // replay or a message from a lost session is never acknowledged. PrivateSos
+        // has no decryption path yet and so has nothing it could truthfully ACK.
+        let ack = if packet.header.packet_type == PacketType::Chat && plaintext.is_some() {
+            Some(self.create_ack(&packet)?)
         } else {
             None
         };
@@ -777,6 +832,7 @@ impl MeshNode {
             packet,
             should_relay,
             ack,
+            acked_message_id,
             handshake_reply,
             plaintext,
             addressed_to_us,
@@ -1042,6 +1098,271 @@ mod tests {
         let received = bob.process_incoming(&on_wire).unwrap();
         assert_eq!(received.plaintext.as_deref(), Some(&b"are you safe?"[..]));
         assert!(received.ack.is_some());
+    }
+
+    #[test]
+    fn a_chat_that_will_not_decrypt_is_never_acknowledged() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let chat = alice.create_chat_packet(bob.node_id, "lost").unwrap();
+
+        // Bob reinstalled and lost the session, so this message cannot be read.
+        bob.sessions.lock().unwrap().drop_session(&alice.node_id);
+
+        let received = bob.process_incoming(&wire(&chat)).unwrap();
+        assert!(received.plaintext.is_none());
+        assert!(
+            received.ack.is_none(),
+            "an ACK would report a delivery to someone who read nothing"
+        );
+    }
+
+    #[test]
+    fn a_chat_no_session_can_open_is_never_acknowledged() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+
+        let stranger = MeshNode::new();
+        let junk = stranger
+            .sign_packet(
+                PacketType::Chat,
+                MeshNode::random_msg_id(),
+                bob.node_id,
+                None,
+                0,
+                vec![0xAB; 64],
+            )
+            .unwrap();
+        assert!(bob.process_incoming(&wire(&junk)).unwrap().ack.is_none());
+    }
+
+    #[test]
+    fn a_private_sos_has_no_decryption_path_so_it_gets_no_ack() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        let private_sos = alice
+            .sign_packet(
+                PacketType::PrivateSos,
+                MeshNode::random_msg_id(),
+                bob.node_id,
+                None,
+                0,
+                vec![1, 2, 3],
+            )
+            .unwrap();
+        assert!(bob
+            .process_incoming(&wire(&private_sos))
+            .unwrap()
+            .ack
+            .is_none());
+    }
+
+    #[test]
+    fn a_retransmitted_chat_is_not_acknowledged_twice() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let chat = alice.create_chat_packet(bob.node_id, "once").unwrap();
+
+        assert!(bob.process_incoming(&wire(&chat)).unwrap().ack.is_some());
+        assert!(bob.process_incoming(&wire(&chat)).unwrap().ack.is_none());
+    }
+
+    /// Alice sends Bob a chat and Bob's ACK comes back ready to be received.
+    fn chat_and_ack(alice: &MeshNode, bob: &MeshNode) -> ([u8; 16], Packet) {
+        let chat = alice
+            .create_chat_packet(bob.node_id, "are you safe?")
+            .unwrap();
+        let ack = bob
+            .process_incoming(&wire(&chat))
+            .unwrap()
+            .ack
+            .expect("a decrypted chat is acknowledged");
+        (chat.header.msg_id, ack)
+    }
+
+    #[test]
+    fn an_ack_names_the_original_message_not_itself() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, ack) = chat_and_ack(&alice, &bob);
+
+        assert_ne!(ack.header.msg_id, msg_id, "an ACK has its own packet id");
+        let received = alice.process_incoming(&wire(&ack)).unwrap();
+        assert_eq!(received.acked_message_id, Some(msg_id));
+    }
+
+    /// An ACK to `to`, carrying `payload`, with a valid signature by `signer`.
+    fn ack_signed_by(signer: &MeshNode, to: &MeshNode, payload: Vec<u8>) -> Packet {
+        signer
+            .sign_packet(
+                PacketType::Ack,
+                MeshNode::random_msg_id(),
+                to.node_id,
+                None,
+                0,
+                payload,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn an_ack_signed_by_anyone_but_the_recipient_is_refused() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, genuine) = chat_and_ack(&alice, &bob);
+
+        // A relay saw the message id go past and signs its own "delivered".
+        let relay = MeshNode::new();
+        let forged = ack_signed_by(&relay, &alice, msg_id.to_vec());
+        assert_eq!(
+            alice
+                .process_incoming(&wire(&forged))
+                .unwrap()
+                .acked_message_id,
+            None
+        );
+
+        // Having tried must not stop the real ACK from landing afterwards.
+        assert_eq!(
+            alice
+                .process_incoming(&wire(&genuine))
+                .unwrap()
+                .acked_message_id,
+            Some(msg_id)
+        );
+    }
+
+    #[test]
+    fn an_ack_for_a_message_never_sent_is_ignored() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        for payload in [vec![7u8; 16], vec![], vec![7u8; 15], vec![7u8; 17]] {
+            let ack = ack_signed_by(&bob, &alice, payload);
+            assert_eq!(
+                alice
+                    .process_incoming(&wire(&ack))
+                    .unwrap()
+                    .acked_message_id,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn an_ack_addressed_to_another_node_settles_nothing() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, _) = chat_and_ack(&alice, &bob);
+
+        // Genuinely from Bob, but sent to someone else, so not a report to Alice.
+        let carol = MeshNode::new();
+        let elsewhere = ack_signed_by(&bob, &carol, msg_id.to_vec());
+        assert_eq!(
+            alice
+                .process_incoming(&wire(&elsewhere))
+                .unwrap()
+                .acked_message_id,
+            None
+        );
+    }
+
+    #[test]
+    fn a_message_is_settled_only_once() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, ack) = chat_and_ack(&alice, &bob);
+        assert!(alice
+            .process_incoming(&wire(&ack))
+            .unwrap()
+            .acked_message_id
+            .is_some());
+
+        // A second ACK under a fresh packet id gets past dedup, not past the table.
+        let again = ack_signed_by(&bob, &alice, msg_id.to_vec());
+        assert_eq!(
+            alice
+                .process_incoming(&wire(&again))
+                .unwrap()
+                .acked_message_id,
+            None
+        );
+    }
+
+    #[test]
+    fn an_ack_arriving_after_a_restart_is_still_accepted() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, ack) = chat_and_ack(&alice, &bob);
+
+        let alice_after_restart = restart(&alice, &[11u8; 32]);
+        assert_eq!(
+            alice_after_restart
+                .process_incoming(&wire(&ack))
+                .unwrap()
+                .acked_message_id,
+            Some(msg_id),
+            "the mesh can take days to bring an ACK back"
+        );
+    }
+
+    #[test]
+    fn a_blob_from_before_pending_acks_still_opens() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (_, ack) = chat_and_ack(&alice, &bob);
+        let key = [12u8; 32];
+
+        let old_format = {
+            let sessions = alice.sessions.lock().unwrap();
+            let groups = alice.groups.lock().unwrap();
+            let trust = alice.trust.lock().unwrap();
+            let state = SecureStateOut {
+                sessions: sessions.sessions_for_export(),
+                groups: &groups,
+                trust: &trust,
+            };
+            crypto::vault::seal(&key, &bincode::serialize(&state).unwrap()).unwrap()
+        };
+
+        let restored = MeshNode::from_secret_key(&alice.secret_key_bytes());
+        restored.import_secure_state(&key, &old_format).unwrap();
+        assert!(restored.has_session_with(&bob.node_id));
+        assert_eq!(
+            restored
+                .process_incoming(&wire(&ack))
+                .unwrap()
+                .acked_message_id,
+            None,
+            "with no record of the send, the message stays \"sent\""
+        );
+    }
+
+    #[test]
+    fn a_wipe_forgets_who_was_written_to() {
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (_, ack) = chat_and_ack(&alice, &bob);
+
+        alice.wipe_secure_state();
+
+        assert!(alice.pending_acks.lock().unwrap().is_empty());
+        assert_eq!(
+            alice
+                .process_incoming(&wire(&ack))
+                .unwrap()
+                .acked_message_id,
+            None
+        );
     }
 
     #[test]
