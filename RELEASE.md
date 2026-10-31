@@ -77,15 +77,19 @@ cd android && ./gradlew testDebugUnitTest
 ./gradlew lintVitalRelease
 ```
 
-**Verify the JNI symbols survived R8.** A mismatch here fails only at runtime, on
-a user's device, with the app silently refusing to send anything:
+**Verify the native JNI exports match Kotlin declarations across all ABIs.** A symbol mismatch between Kotlin external fun declarations and the native cdylib fails only at runtime on a user's device with UnsatisfiedLinkError. Run the automated verification tool across all shipped ABIs:
+
+```bash
+python tools/release/check_jni.py --variant release
+```
+
+Or manually using `llvm-nm`:
 
 ```bash
 NM="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/<host>/bin/llvm-nm"
 "$NM" -D --defined-only android/app/build/rustJniLibs/release/arm64-v8a/libmeshline_ffi.so \
-  | grep -o "Java_org_meshline[A-Za-z_0-9]*" | sed 's/.*MeshCoreBridge_//' | sort > /tmp/so.txt
-grep -oP 'external fun \K\w+' \
-  android/app/src/main/java/org/meshline/app/bridge/MeshCoreBridge.kt | sort > /tmp/kt.txt
+  | grep -o "Java_org_meshline\w*" | sort > /tmp/so.txt
+python -c "import re; methods = re.findall(r'external fun (\w+)', open('android/app/src/main/java/org/meshline/app/bridge/MeshCoreBridge.kt').read()); print('\n'.join(sorted(f'Java_org_meshline_app_bridge_MeshCoreBridge_{m}' for m in methods)))" > /tmp/kt.txt
 diff /tmp/so.txt /tmp/kt.txt && echo "JNI symbols match"
 ```
 
