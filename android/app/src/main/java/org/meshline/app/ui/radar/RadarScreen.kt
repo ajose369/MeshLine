@@ -299,7 +299,7 @@ private fun RadarFace(
                 color = if (peers.isEmpty()) TextMuted else EmergencyGreen
             )
             Text(
-                text = if (peers.size == 1) "IN DIRECT RANGE" else "IN DIRECT RANGE",
+                text = if (peers.size == 1) "DEVICE IN DIRECT RANGE" else "DEVICES IN DIRECT RANGE",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextMuted
             )
@@ -352,9 +352,6 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
             val hops = peer.hopCount ?: 1
             append(" · mesh relayed ($hops ${if (hops == 1) "hop" else "hops"}) · unknown signal")
         }
-        if (peer.isCustodyHolder) {
-            append(" · holding ${peer.custodyPacketsHeld} pkts")
-        }
         append(" · heard ${secondsAgo}s ago")
     }
 
@@ -363,20 +360,11 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
             SignalBars(peer.rssiDbm, colour)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        peer.displayName,
-                        style = MaterialTheme.typography.titleSmall,
-                        color = TextPrimary
-                    )
-                    if (peer.isCustodyHolder) {
-                        Spacer(Modifier.width(6.dp))
-                        StatusPill(
-                            text = "custody",
-                            color = NeonCyan
-                        )
-                    }
-                }
+                Text(
+                    peer.displayName,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary
+                )
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = subtitle,

@@ -15,6 +15,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.meshline.app.bridge.MeshCoreBridge
 import org.meshline.app.security.SecureStateStore
+import org.meshline.app.ui.radar.PeerObservation
+import org.meshline.app.ui.radar.RadarProjection
 
 enum class PeerReachability {
     DIRECT,
@@ -37,10 +39,9 @@ data class PeerNodeEntity(
     val isVerified: Boolean = false,
     val reachability: PeerReachability = PeerReachability.RELAYED,
     val hopCount: Int? = null,
-    val custodyPacketsHeld: Int = 0
+    val lastDirectMillis: Long? = null
 ) {
     val isDirect: Boolean get() = reachability == PeerReachability.DIRECT
-    val isCustodyHolder: Boolean get() = custodyPacketsHeld > 0
 }
 
 /** The outcome of a membership change, for a UI that must not overstate it. */
@@ -433,10 +434,21 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
             obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
 
-            // DEFAULT_TTL is 8. A 1-hop packet has ttl >= 7 when processed.
-            // Hops > 1 means the packet arrived via intermediate mesh relay(s).
-            val hops = (8 - ttl).coerceAtLeast(1)
-            val isDirect = hops <= 1 && directLinkRssi != null
+            // Check additive fields if provided (B-RFC-001)
+            val hopsOnArrival = obj.optInt("hops_on_arrival", -1)
+            val isDuplicate = obj.optBoolean("is_duplicate", false)
+            val hops = if (hopsOnArrival >= 0) {
+                hopsOnArrival
+            } else if (isDuplicate) {
+                // Duplicates in flood routing retain raw wire TTL, so a 1-relay duplicate
+                // has wire ttl=7. A duplicate via a relay must never be treated as direct.
+                2
+            } else {
+                // Note: TTL is excluded from wire packet signature (schema.rs), so a low
+                // hop count is physical transport evidence, not cryptographic proximity proof.
+                (8 - ttl).coerceAtLeast(1)
+            }
+            val isDirect = hops <= 1 && directLinkRssi != null && !isDuplicate
             val reachability = if (isDirect) PeerReachability.DIRECT else PeerReachability.RELAYED
             val rssi = if (isDirect) directLinkRssi else null
 
@@ -590,47 +602,28 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         transport: String,
         rssiDbm: Int? = null,
         reachability: PeerReachability = PeerReachability.RELAYED,
-        hopCount: Int? = null,
-        custodyPacketsHeld: Int = 0
+        hopCount: Int? = null
     ) {
         val existing = peerStore[nodeId]
-        val effectiveReachability = if (reachability == PeerReachability.DIRECT) {
-            PeerReachability.DIRECT
-        } else {
-            existing?.reachability ?: PeerReachability.RELAYED
-        }
-        val effectiveRssi = if (effectiveReachability == PeerReachability.DIRECT) {
-            rssiDbm ?: existing?.rssiDbm
-        } else {
-            null
-        }
-        val effectiveHopCount = if (effectiveReachability == PeerReachability.DIRECT) {
-            1
-        } else {
-            hopCount ?: existing?.hopCount
-        }
-        val effectiveCustody = custodyPacketsHeld.coerceAtLeast(existing?.custodyPacketsHeld ?: 0)
-
-        peerStore[nodeId] = PeerNodeEntity(
+        val observation = PeerObservation(
             nodeId = nodeId,
-            displayName = "Node ${nodeId.take(6)}",
-            rssiDbm = effectiveRssi,
-            lastSeenMillis = System.currentTimeMillis(),
             transport = transport,
-            hasSecureSession = MeshCoreBridge.hasSession(nodeId),
-            isVerified = MeshCoreBridge.isPeerVerified(nodeId),
-            reachability = effectiveReachability,
-            hopCount = effectiveHopCount,
-            custodyPacketsHeld = effectiveCustody
+            rssiDbm = rssiDbm,
+            reachability = reachability,
+            hopCount = hopCount
+        )
+        val now = System.currentTimeMillis()
+        val hasSession = MeshCoreBridge.hasSession(nodeId)
+        val isVerified = MeshCoreBridge.isPeerVerified(nodeId)
+
+        peerStore[nodeId] = RadarProjection.mergePeerObservation(
+            existing = existing,
+            observation = observation,
+            nowMillis = now,
+            hasSession = hasSession,
+            isVerified = isVerified
         )
         publishPeers()
-    }
-
-    fun updatePeerCustody(nodeId: String, custodyPacketsHeld: Int) {
-        peerStore[nodeId]?.let {
-            peerStore[nodeId] = it.copy(custodyPacketsHeld = custodyPacketsHeld)
-            publishPeers()
-        }
     }
 
     private fun refreshPeerSessionState(nodeId: String) {
@@ -644,10 +637,20 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     }
 
     fun prunePeers() {
-        val cutoff = System.currentTimeMillis() - PEER_STALE_MILLIS
+        val now = System.currentTimeMillis()
+        val cutoff = now - PEER_STALE_MILLIS
         val before = peerStore.size
         peerStore.values.removeIf { it.lastSeenMillis < cutoff }
-        if (peerStore.size != before) publishPeers()
+
+        // Expire direct reachability for peers not heard directly within DIRECT_LINK_EXPIRY_MILLIS
+        var directExpired = false
+        peerStore.replaceAll { _, peer ->
+            val updated = RadarProjection.recheckPeerExpiry(peer, now)
+            if (updated !== peer) directExpired = true
+            updated
+        }
+
+        if (peerStore.size != before || directExpired) publishPeers()
     }
 
     private fun publishPeers() {

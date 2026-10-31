@@ -104,25 +104,17 @@ class PeerNodeEntityTest {
     }
 
     @Test
-    fun `custody holder flag reflects packets held for mesh`() {
-        val holder = PeerNodeEntity(
+    fun `direct peer retains lastDirectMillis timestamp`() {
+        val peer = PeerNodeEntity(
             nodeId = "p3",
             displayName = "Node p3",
-            lastSeenMillis = 1000L,
+            lastSeenMillis = 5000L,
             transport = "Bluetooth LE",
-            custodyPacketsHeld = 2
+            reachability = PeerReachability.DIRECT,
+            lastDirectMillis = 5000L
         )
-        assertTrue(holder.isCustodyHolder)
-        assertEquals(2, holder.custodyPacketsHeld)
-
-        val nonHolder = PeerNodeEntity(
-            nodeId = "p4",
-            displayName = "Node p4",
-            lastSeenMillis = 1000L,
-            transport = "Bluetooth LE",
-            custodyPacketsHeld = 0
-        )
-        assertFalse(nonHolder.isCustodyHolder)
+        assertTrue(peer.isDirect)
+        assertEquals(5000L, peer.lastDirectMillis)
     }
 }
 

@@ -268,6 +268,7 @@ class BleTransportManager(private val context: Context) {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     connectedDevices.remove(address)
                     negotiatedMtu.remove(address)
+                    deviceRssi.remove(address)
                     // Anything half-written is requeued rather than lost: these
                     // packets were removed from the store's outbound queue when
                     // the connection began.
@@ -475,8 +476,9 @@ class BleTransportManager(private val context: Context) {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     // A peer that vanishes mid-packet must not leave its
-                    // fragments occupying the reassembly table.
+                    // fragments occupying the reassembly table or keep stale RSSI.
                     address?.let { addr ->
+                        deviceRssi.remove(addr)
                         synchronized(reassemblyLock) { reassembler.forgetDevice(addr) }
                     }
                 }
@@ -580,6 +582,7 @@ class BleTransportManager(private val context: Context) {
 
         override fun onScanFailed(errorCode: Int) {
             Log.w(TAG, "Scan failed with code $errorCode.")
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
         }
     }
 

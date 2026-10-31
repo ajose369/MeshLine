@@ -2,6 +2,7 @@ package org.meshline.app.ui.radar
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -113,29 +114,169 @@ class RadarProjectionTest {
     }
 
     @Test
-    fun `peer entity reachability and custody flags reflect state honestly`() {
-        val directCustodyPeer = PeerNodeEntity(
-            nodeId = "n1",
-            displayName = "Node n1",
+    fun `direct observation records direct reachability, physical RSSI and timestamp`() {
+        val obs = PeerObservation(
+            nodeId = "p1",
+            transport = "Bluetooth LE",
             rssiDbm = -60,
-            lastSeenMillis = 1000L,
+            reachability = PeerReachability.DIRECT,
+            hopCount = 1
+        )
+        val peer = RadarProjection.mergePeerObservation(
+            existing = null,
+            observation = obs,
+            nowMillis = 10_000L,
+            hasSession = true,
+            isVerified = false
+        )
+
+        assertTrue(peer.isDirect)
+        assertEquals(-60, peer.rssiDbm)
+        assertEquals(10_000L, peer.lastDirectMillis)
+        assertEquals(1, peer.hopCount)
+    }
+
+    @Test
+    fun `direct peer transitions to relayed when window expires`() {
+        val directPeer = PeerNodeEntity(
+            nodeId = "p1",
+            displayName = "Node p1",
+            rssiDbm = -60,
+            lastSeenMillis = 10_000L,
             transport = "Bluetooth LE",
             reachability = PeerReachability.DIRECT,
-            custodyPacketsHeld = 3
+            lastDirectMillis = 10_000L
         )
-        assertTrue(directCustodyPeer.isDirect)
-        assertTrue(directCustodyPeer.isCustodyHolder)
 
-        val relayedPeer = PeerNodeEntity(
-            nodeId = "n2",
-            displayName = "Node n2",
+        // Relayed observation 31 seconds later (> 30s DIRECT_LINK_EXPIRY_MILLIS)
+        val relayedObs = PeerObservation(
+            nodeId = "p1",
+            transport = "Bluetooth LE",
             rssiDbm = null,
-            lastSeenMillis = 1000L,
+            reachability = PeerReachability.RELAYED,
+            hopCount = 1
+        )
+        val merged = RadarProjection.mergePeerObservation(
+            existing = directPeer,
+            observation = relayedObs,
+            nowMillis = 41_001L,
+            hasSession = true,
+            isVerified = false
+        )
+
+        assertFalse("Peer must drop to RELAYED after direct window expires", merged.isDirect)
+        assertNull("RSSI must be cleared on expiration", merged.rssiDbm)
+        assertNull("lastDirectMillis must be cleared", merged.lastDirectMillis)
+    }
+
+    @Test
+    fun `direct peer drops to relayed immediately if packet arrived via multi-hop`() {
+        val directPeer = PeerNodeEntity(
+            nodeId = "p1",
+            displayName = "Node p1",
+            rssiDbm = -50,
+            lastSeenMillis = 10_000L,
+            transport = "Bluetooth LE",
+            reachability = PeerReachability.DIRECT,
+            lastDirectMillis = 10_000L
+        )
+
+        // Relayed packet from origin heard 5 seconds later over 3 hops
+        val multiHopObs = PeerObservation(
+            nodeId = "p1",
+            transport = "Bluetooth LE",
+            rssiDbm = null,
+            reachability = PeerReachability.RELAYED,
+            hopCount = 3
+        )
+        val merged = RadarProjection.mergePeerObservation(
+            existing = directPeer,
+            observation = multiHopObs,
+            nowMillis = 15_000L,
+            hasSession = true,
+            isVerified = false
+        )
+
+        assertFalse("Multi-hop packet proves origin is not a direct link", merged.isDirect)
+        assertNull(merged.rssiDbm)
+        assertEquals(3, merged.hopCount)
+    }
+
+    @Test
+    fun `relayed peer upgrades to direct upon fresh physical BLE measurement`() {
+        val relayedPeer = PeerNodeEntity(
+            nodeId = "p1",
+            displayName = "Node p1",
+            rssiDbm = null,
+            lastSeenMillis = 10_000L,
             transport = "Bluetooth LE",
             reachability = PeerReachability.RELAYED,
-            custodyPacketsHeld = 0
+            hopCount = 2
         )
-        assertFalse(relayedPeer.isDirect)
-        assertFalse(relayedPeer.isCustodyHolder)
+
+        val directObs = PeerObservation(
+            nodeId = "p1",
+            transport = "Bluetooth LE",
+            rssiDbm = -55,
+            reachability = PeerReachability.DIRECT,
+            hopCount = 1
+        )
+        val merged = RadarProjection.mergePeerObservation(
+            existing = relayedPeer,
+            observation = directObs,
+            nowMillis = 20_000L,
+            hasSession = true,
+            isVerified = false
+        )
+
+        assertTrue(merged.isDirect)
+        assertEquals(-55, merged.rssiDbm)
+        assertEquals(20_000L, merged.lastDirectMillis)
+        assertEquals(1, merged.hopCount)
+    }
+
+    @Test
+    fun `1-hop observation without directLinkRssi remains relayed with null RSSI`() {
+        val obs = PeerObservation(
+            nodeId = "p1",
+            transport = "Bluetooth LE",
+            rssiDbm = null,
+            reachability = PeerReachability.RELAYED,
+            hopCount = 1
+        )
+        val peer = RadarProjection.mergePeerObservation(
+            existing = null,
+            observation = obs,
+            nowMillis = 10_000L,
+            hasSession = false,
+            isVerified = false
+        )
+
+        assertFalse(peer.isDirect)
+        assertNull(peer.rssiDbm)
+    }
+
+    @Test
+    fun `recheckPeerExpiry downgrades direct peer when idle time exceeds direct window`() {
+        val directPeer = PeerNodeEntity(
+            nodeId = "p1",
+            displayName = "Node p1",
+            rssiDbm = -60,
+            lastSeenMillis = 10_000L,
+            transport = "Bluetooth LE",
+            reachability = PeerReachability.DIRECT,
+            lastDirectMillis = 10_000L
+        )
+
+        // 20s later: still valid
+        val valid = RadarProjection.recheckPeerExpiry(directPeer, nowMillis = 30_000L)
+        assertTrue(valid.isDirect)
+        assertNotNull(valid.rssiDbm)
+
+        // 31s later: expired
+        val expired = RadarProjection.recheckPeerExpiry(directPeer, nowMillis = 40_001L)
+        assertFalse(expired.isDirect)
+        assertNull(expired.rssiDbm)
+        assertNull(expired.lastDirectMillis)
     }
 }
