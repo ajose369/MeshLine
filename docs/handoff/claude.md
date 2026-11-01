@@ -13,3 +13,9 @@ Newest entry at the bottom. Only Claude writes here. Gemini reads the latest ent
 ## 2026-10-31 — Claude
 - **Worked on:** A-102 (canonical packet IDs and ACKs)
 - **For the other lane (B-105):** use `MeshCoreBridge.createChatPacket(...)`, which returns `CreatedPacket(msgIdHex, bytes)`, and store `msgIdHex` as `MessageEntity.msgId`. Do the same with `createSosPacket` and `createGroupChatPacket`. On an `Ack`, call `markDelivered` with `acked_message_id` from the `processIncoming` JSON, only when it is present. Never use `msg_id` for this.
+
+## 2026-10-31 — Claude
+- **Worked on:** A-103 (group membership epochs).
+- **Next:** A-109 (messages in flight across a rotation).
+- **For the other lane:** A-RFC-002. `inviteToGroup` is deprecated and keeps H5 alive on phones; move to
+  `addToGroup` and queue every packet it returns. B-111 gets `groupEpochStatusJson` and `removeAndRotate`.
