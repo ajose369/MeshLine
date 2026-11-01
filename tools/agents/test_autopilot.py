@@ -279,6 +279,22 @@ class RateLimitTest(unittest.TestCase):
             self.assertEqual(supervisor.LaneA(None).runs_today(), 1)
 
 
+class RepeatPauseTest(unittest.TestCase):
+    """The no-progress pause lasts an hour; it must not silently become permanent."""
+
+    def test_same_action_is_dispatched_again_after_the_pause(self):
+        lane = supervisor.LaneA("claude.exe")
+        action = {"kind": "FIX_CI", "pr": 14}
+        lane.recent = ["FIX_CI:14"] * 3
+        with mock.patch.object(lane, "runs_today", return_value=0), mock.patch.object(lane, "start") as start:
+            lane.tick(action)
+            start.assert_not_called()
+            self.assertGreater(lane.paused_until, time.time())
+            lane.paused_until = time.time() - 1
+            lane.tick(action)
+            start.assert_called_once_with(action, "FIX_CI:14")
+
+
 class LaneBMonitorTest(unittest.TestCase):
     """Antigravity never calls the hooks, so Gemini's pushes must count as activity."""
 
