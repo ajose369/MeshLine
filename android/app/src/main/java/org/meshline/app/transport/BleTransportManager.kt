@@ -30,6 +30,7 @@ import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import org.meshline.app.bridge.MeshCoreBridge
 import org.meshline.app.db.StoreAndForwardManager
 import org.meshline.app.permissions.MeshPermissions
 
@@ -170,6 +171,9 @@ class BleTransportManager(private val context: Context) {
 
     internal var closeInvoker: (gatt: BluetoothGatt) -> Unit =
         ::defaultClose
+
+    internal var packetIdResolver: (ByteArray) -> String? =
+        MeshCoreBridge::packetId
 
     /** Negotiated ATT MTU per peer, until one is agreed. */
     private val negotiatedMtu = ConcurrentHashMap<String, Int>()
@@ -504,6 +508,21 @@ class BleTransportManager(private val context: Context) {
 
             // Mark the submitted frame as successfully acknowledged
             state.acknowledgedIndex = state.submittedIndex
+
+            // If this frame completed transmission of a whole packet, mark it sent
+            val ackedIdx = state.acknowledgedIndex
+            if (ackedIdx in state.frames.indices) {
+                val currentPacketIdx = state.frames[ackedIdx].packetIndex
+                val isLastFrameOfPacket = ackedIdx + 1 == state.frames.size ||
+                    state.frames[ackedIdx + 1].packetIndex > currentPacketIdx
+                if (isLastFrameOfPacket && currentPacketIdx in state.packets.indices) {
+                    val packet = state.packets[currentPacketIdx]
+                    val packetId = packetIdResolver(packet)
+                    if (packetId != null) {
+                        StoreAndForwardManager.getInstance(context).markSent(packetId)
+                    }
+                }
+            }
 
             // If this was the last frame of the entire queue, finish and disconnect
             if (state.acknowledgedIndex >= state.frames.size - 1) {
