@@ -70,6 +70,7 @@ class BleTransportManager(private val context: Context) {
 
     private val connectedDevices = Collections.synchronizedSet(mutableSetOf<String>())
     private val peerCount = AtomicInteger(0)
+    private val deviceRssi = ConcurrentHashMap<String, Int>()
 
     /** One BLE write, and which packet it belongs to. */
     private data class Frame(val packetIndex: Int, val bytes: ByteArray)
@@ -129,6 +130,7 @@ class BleTransportManager(private val context: Context) {
             startAdvertising()
             startScanning()
             lastError = null
+            StoreAndForwardManager.getInstance(context).setTransportActive(true)
             true
         } catch (e: SecurityException) {
             // Possible if a permission is revoked between the check and the call.
@@ -164,10 +166,12 @@ class BleTransportManager(private val context: Context) {
             bleAdvertiser = null
             bleScanner = null
             connectedDevices.clear()
+            deviceRssi.clear()
             writeStates.clear()
             negotiatedMtu.clear()
             synchronized(reassemblyLock) { reassembler.clear() }
             peerCount.set(0)
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
         }
     }
 
@@ -264,6 +268,7 @@ class BleTransportManager(private val context: Context) {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     connectedDevices.remove(address)
                     negotiatedMtu.remove(address)
+                    deviceRssi.remove(address)
                     // Anything half-written is requeued rather than lost: these
                     // packets were removed from the store's outbound queue when
                     // the connection began.
@@ -471,8 +476,9 @@ class BleTransportManager(private val context: Context) {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     peerCount.updateAndGet { (it - 1).coerceAtLeast(0) }
                     // A peer that vanishes mid-packet must not leave its
-                    // fragments occupying the reassembly table.
+                    // fragments occupying the reassembly table or keep stale RSSI.
                     address?.let { addr ->
+                        deviceRssi.remove(addr)
                         synchronized(reassemblyLock) { reassembler.forgetDevice(addr) }
                     }
                 }
@@ -517,8 +523,13 @@ class BleTransportManager(private val context: Context) {
                 }
 
                 if (packet != null) {
+                    val directRssi = if (deviceKey != "unknown") deviceRssi[deviceKey] else null
                     StoreAndForwardManager.getInstance(context)
-                        .processIncomingPacket(packet, transport = "Bluetooth LE")
+                        .processIncomingPacket(
+                            packet,
+                            transport = "Bluetooth LE",
+                            directLinkRssi = directRssi
+                        )
                 }
             }
 
@@ -545,6 +556,7 @@ class BleTransportManager(private val context: Context) {
 
         override fun onStartFailure(errorCode: Int) {
             Log.w(TAG, "Advertising failed with code $errorCode.")
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
             lastError = when (errorCode) {
                 ADVERTISE_FAILED_FEATURE_UNSUPPORTED ->
                     "This device cannot advertise over Bluetooth LE."
@@ -563,6 +575,7 @@ class BleTransportManager(private val context: Context) {
             } catch (e: SecurityException) {
                 return
             }
+            deviceRssi[address] = result.rssi
             if (connectedDevices.add(address)) {
                 connectToPeer(device)
             }
@@ -570,6 +583,7 @@ class BleTransportManager(private val context: Context) {
 
         override fun onScanFailed(errorCode: Int) {
             Log.w(TAG, "Scan failed with code $errorCode.")
+            StoreAndForwardManager.getInstance(context).setTransportActive(false)
         }
     }
 

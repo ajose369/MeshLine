@@ -51,6 +51,8 @@ fun RadarScreen() {
     val context = LocalContext.current
     val store = remember { StoreAndForwardManager.getInstance(context) }
     val peers by store.peersFlow.collectAsState()
+    val transportActive by store.transportActiveFlow.collectAsState()
+    val plottablePeers = remember(peers) { RadarProjection.plottablePeers(peers) }
 
     var nodeId by remember { mutableStateOf<String?>(null) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -62,6 +64,8 @@ fun RadarScreen() {
             delay(5_000)
         }
     }
+
+    val custodyCount = remember(now) { store.pendingOutboundCount() }
 
     Column(
         modifier = Modifier
@@ -78,8 +82,9 @@ fun RadarScreen() {
         Spacer(Modifier.height(16.dp))
 
         RadarFace(
-            peers = peers,
-            live = MeshCoreBridge.isReady(),
+            peers = plottablePeers,
+            totalPeerCount = peers.size,
+            live = transportActive,
             modifier = Modifier
                 .align(Alignment.CenterHorizontally)
                 .size(250.dp)
@@ -95,11 +100,23 @@ fun RadarScreen() {
                 MeshMark(Modifier.size(20.dp), color = if (nodeId != null) NeonCyan else SignalRed)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        "THIS DEVICE",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "THIS DEVICE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextMuted
+                        )
+                        if (custodyCount > 0) {
+                            StatusPill(
+                                text = "custody: $custodyCount ${if (custodyCount == 1) "pkt" else "pkts"}",
+                                color = NeonCyan
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(3.dp))
                     Text(
                         text = nodeId ?: "Mesh core unavailable",
@@ -155,6 +172,7 @@ fun RadarScreen() {
 @Composable
 private fun RadarFace(
     peers: List<PeerNodeEntity>,
+    totalPeerCount: Int,
     live: Boolean,
     modifier: Modifier = Modifier
 ) {
@@ -247,8 +265,9 @@ private fun RadarFace(
             drawCircle(NeonCyan, 3f, centre)
 
             peers.forEach { peer ->
+                val fraction = RadarProjection.rangeFraction(peer.rssiDbm) ?: return@forEach
                 val angle = Math.toRadians(peerAngle(peer.nodeId).toDouble())
-                val distance = outer * peerRange(peer.rssiDbm)
+                val distance = outer * fraction
                 val at = Offset(
                     centre.x + distance * sin(angle).toFloat(),
                     centre.y - distance * cos(angle).toFloat()
@@ -271,7 +290,7 @@ private fun RadarFace(
         // a peer plotted close in.
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.offset(y = 46.dp)
+            modifier = Modifier.offset(y = 44.dp)
         ) {
             Text(
                 text = "${peers.size}",
@@ -280,10 +299,20 @@ private fun RadarFace(
                 color = if (peers.isEmpty()) TextMuted else EmergencyGreen
             )
             Text(
-                text = if (peers.size == 1) "DEVICE IN RANGE" else "DEVICES IN RANGE",
+                text = if (peers.size == 1) "DEVICE IN DIRECT RANGE" else "DEVICES IN DIRECT RANGE",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextMuted
             )
+            val relayedCount = (totalPeerCount - peers.size).coerceAtLeast(0)
+            if (relayedCount > 0) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "+$relayedCount heard recently",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 9.sp,
+                    color = NeonCyan
+                )
+            }
         }
     }
 }
@@ -293,12 +322,6 @@ private fun peerAngle(nodeId: String): Float {
     var hash = 7
     nodeId.forEach { hash = hash * 31 + it.code }
     return abs(hash % 360).toFloat()
-}
-
-/** RSSI mapped onto the face: −40 dBm sits near the centre, −95 at the rim. */
-private fun peerRange(rssiDbm: Int): Float {
-    val clamped = rssiDbm.coerceIn(-95, -40)
-    return (0.18f + (abs(clamped) - 40) / 55f * 0.76f).coerceIn(0.18f, 0.94f)
 }
 
 /* ---------------------------------------------------------------------------
@@ -318,6 +341,24 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
         else -> "unverified"
     }
 
+    val subtitle = buildString {
+        append(peer.transport)
+        if (peer.isDirect) {
+            append(" · direct link")
+            if (peer.rssiDbm != null) {
+                append(" · ${peer.rssiDbm} dBm")
+            }
+        } else {
+            if (peer.hopCount != null && peer.hopCount > 0) {
+                val hops = peer.hopCount
+                append(" · mesh relayed ($hops ${if (hops == 1) "hop" else "hops"}) · unknown signal")
+            } else {
+                append(" · route unknown · unknown signal")
+            }
+        }
+        append(" · heard ${secondsAgo}s ago")
+    }
+
     GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(13.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SignalBars(peer.rssiDbm, colour)
@@ -330,7 +371,7 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "${peer.transport} · ${peer.rssiDbm} dBm · heard ${secondsAgo}s ago",
+                    text = subtitle,
                     style = MaterialTheme.typography.labelSmall,
                     fontSize = 9.sp,
                     color = TextMuted
@@ -346,15 +387,10 @@ private fun PeerRow(peer: PeerNodeEntity, nowMillis: Long) {
     }
 }
 
-/** Four bars filled from the measured RSSI. */
+/** Four bars filled from the measured RSSI (0 bars if unknown/null). */
 @Composable
-private fun SignalBars(rssiDbm: Int, colour: Color) {
-    val filled = when {
-        rssiDbm >= -55 -> 4
-        rssiDbm >= -70 -> 3
-        rssiDbm >= -82 -> 2
-        else -> 1
-    }
+private fun SignalBars(rssiDbm: Int?, colour: Color) {
+    val filled = RadarProjection.signalBarCount(rssiDbm)
     Row(
         verticalAlignment = Alignment.Bottom,
         horizontalArrangement = Arrangement.spacedBy(2.dp),

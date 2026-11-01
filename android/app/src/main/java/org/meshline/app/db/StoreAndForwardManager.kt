@@ -15,12 +15,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.meshline.app.bridge.MeshCoreBridge
 import org.meshline.app.security.SecureStateStore
+import org.meshline.app.ui.radar.PeerObservation
+import org.meshline.app.ui.radar.RadarProjection
+
+enum class PeerReachability {
+    DIRECT,
+    RELAYED
+}
 
 /** A peer this device has actually heard from. */
 data class PeerNodeEntity(
     val nodeId: String,
     val displayName: String,
-    val rssiDbm: Int,
+    val rssiDbm: Int? = null,
     val lastSeenMillis: Long,
     val transport: String,
     val hasSecureSession: Boolean = false,
@@ -29,8 +36,13 @@ data class PeerNodeEntity(
      * An encrypted session proves the key is consistent; only this proves the
      * person holding it is who you think.
      */
-    val isVerified: Boolean = false
-)
+    val isVerified: Boolean = false,
+    val reachability: PeerReachability = PeerReachability.RELAYED,
+    val hopCount: Int? = null,
+    val lastDirectMillis: Long? = null
+) {
+    val isDirect: Boolean get() = reachability == PeerReachability.DIRECT
+}
 
 /** The outcome of a membership change, for a UI that must not overstate it. */
 data class GroupRekeyReport(
@@ -66,6 +78,13 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
     private val _peersFlow = MutableStateFlow<List<PeerNodeEntity>>(emptyList())
     val peersFlow: StateFlow<List<PeerNodeEntity>> = _peersFlow.asStateFlow()
+
+    private val _transportActiveFlow = MutableStateFlow(false)
+    val transportActiveFlow: StateFlow<Boolean> = _transportActiveFlow.asStateFlow()
+
+    fun setTransportActive(active: Boolean) {
+        _transportActiveFlow.value = active
+    }
 
     private val _groupsFlow = MutableStateFlow<List<GroupEntity>>(emptyList())
     val groupsFlow: StateFlow<List<GroupEntity>> = _groupsFlow.asStateFlow()
@@ -389,7 +408,11 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * result. Frames that fail authentication are dropped silently; they are
      * noise or hostile, and either way nothing about them should reach the UI.
      */
-    fun processIncomingPacket(rawPacket: ByteArray, transport: String = "Bluetooth LE") {
+    fun processIncomingPacket(
+        rawPacket: ByteArray,
+        transport: String = "Bluetooth LE",
+        directLinkRssi: Int? = null
+    ) {
         val json = MeshCoreBridge.processIncoming(rawPacket)
         if (json == null) {
             // Not an error worth surfacing: unverifiable traffic is expected on
@@ -411,7 +434,24 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
             obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
 
-            observePeer(senderId, transport)
+            // Classify transport hop evidence fail-closed (B-RFC-001, REVIEW H13).
+            // Without explicit core confirmation via hops_on_arrival == 0, no packet
+            // is treated as direct.
+            val hopsOnArrival = if (obj.has("hops_on_arrival")) obj.getInt("hops_on_arrival") else null
+            val isDuplicate = obj.optBoolean("is_duplicate", false)
+            val classification = RadarProjection.classifyHopObservation(
+                hopsOnArrival = hopsOnArrival,
+                isDuplicate = isDuplicate,
+                directLinkRssi = directLinkRssi
+            )
+
+            observePeer(
+                nodeId = senderId,
+                transport = transport,
+                rssiDbm = classification.rssiDbm,
+                reachability = classification.reachability,
+                hopCount = classification.hopCount
+            )
 
             when (packetType) {
                 "PublicSos" -> obj.optStringOrNull("sos_text")?.let { text ->
@@ -550,16 +590,31 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     // -----------------------------------------------------------------------
 
     /** Records that we heard an authenticated packet from this node. */
-    fun observePeer(nodeId: String, transport: String, rssiDbm: Int? = null) {
+    fun observePeer(
+        nodeId: String,
+        transport: String,
+        rssiDbm: Int? = null,
+        reachability: PeerReachability = PeerReachability.RELAYED,
+        hopCount: Int? = null
+    ) {
         val existing = peerStore[nodeId]
-        peerStore[nodeId] = PeerNodeEntity(
+        val observation = PeerObservation(
             nodeId = nodeId,
-            displayName = "Node ${nodeId.take(6)}",
-            rssiDbm = rssiDbm ?: existing?.rssiDbm ?: 0,
-            lastSeenMillis = System.currentTimeMillis(),
             transport = transport,
-            hasSecureSession = MeshCoreBridge.hasSession(nodeId),
-            isVerified = MeshCoreBridge.isPeerVerified(nodeId)
+            rssiDbm = rssiDbm,
+            reachability = reachability,
+            hopCount = hopCount
+        )
+        val now = System.currentTimeMillis()
+        val hasSession = MeshCoreBridge.hasSession(nodeId)
+        val isVerified = MeshCoreBridge.isPeerVerified(nodeId)
+
+        peerStore[nodeId] = RadarProjection.mergePeerObservation(
+            existing = existing,
+            observation = observation,
+            nowMillis = now,
+            hasSession = hasSession,
+            isVerified = isVerified
         )
         publishPeers()
     }
@@ -575,10 +630,20 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     }
 
     fun prunePeers() {
-        val cutoff = System.currentTimeMillis() - PEER_STALE_MILLIS
+        val now = System.currentTimeMillis()
+        val cutoff = now - PEER_STALE_MILLIS
         val before = peerStore.size
         peerStore.values.removeIf { it.lastSeenMillis < cutoff }
-        if (peerStore.size != before) publishPeers()
+
+        // Expire direct reachability for peers not heard directly within DIRECT_LINK_EXPIRY_MILLIS
+        var directExpired = false
+        peerStore.replaceAll { _, peer ->
+            val updated = RadarProjection.recheckPeerExpiry(peer, now)
+            if (updated !== peer) directExpired = true
+            updated
+        }
+
+        if (peerStore.size != before || directExpired) publishPeers()
     }
 
     private fun publishPeers() {
