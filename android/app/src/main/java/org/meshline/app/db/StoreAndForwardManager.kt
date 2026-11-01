@@ -107,6 +107,15 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         syncGroups()
     }
 
+    internal var createSosPacketInvoker: (String, Double?, Double?, Float?) -> MeshCoreBridge.CreatedPacket? =
+        MeshCoreBridge::createSosPacket
+    internal var createChatPacketInvoker: (String, String) -> MeshCoreBridge.CreatedPacket? =
+        MeshCoreBridge::createChatPacket
+    internal var createGroupChatPacketInvoker: (String, String) -> MeshCoreBridge.CreatedPacket? =
+        MeshCoreBridge::createGroupChatPacket
+    internal var processIncomingInvoker: (ByteArray) -> String? =
+        MeshCoreBridge::processIncoming
+
     companion object {
         private const val TAG = "MeshStore"
 
@@ -121,6 +130,11 @@ class StoreAndForwardManager private constructor(private val context: Context) {
                 INSTANCE ?: StoreAndForwardManager(context.applicationContext)
                     .also { INSTANCE = it }
             }
+
+        @androidx.annotation.VisibleForTesting
+        fun resetForTesting() {
+            INSTANCE = null
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -139,14 +153,14 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         longitude: Double? = null,
         accuracyMeters: Float? = null,
     ): Boolean {
-        val packet = MeshCoreBridge.createSos(text, latitude, longitude, accuracyMeters)
-        if (packet == null) {
+        val created = createSosPacketInvoker(text, latitude, longitude, accuracyMeters)
+        if (created == null) {
             Log.e(TAG, "SOS could not be created; mesh core unavailable.")
-            recordLocalMessage(text, "PublicSos", MessageStatus.FAILED)
+            recordLocalMessage(UUID.randomUUID().toString(), text, "PublicSos", MessageStatus.FAILED)
             return false
         }
-        outboundQueue.add(packet)
-        recordLocalMessage(text, "PublicSos", MessageStatus.QUEUED)
+        outboundQueue.add(created.bytes)
+        recordLocalMessage(created.msgIdHex, text, "PublicSos", MessageStatus.QUEUED)
         return true
     }
 
@@ -156,14 +170,14 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * message is never downgraded to plaintext.
      */
     fun sendChat(recipientIdHex: String, text: String): Boolean {
-        val packet = MeshCoreBridge.createChat(recipientIdHex, text)
-        if (packet == null) {
+        val created = createChatPacketInvoker(recipientIdHex, text)
+        if (created == null) {
             Log.w(TAG, "Chat not sent: no secure session with $recipientIdHex.")
-            recordLocalMessage(text, "Chat", MessageStatus.FAILED, recipientIdHex, encrypted = true)
+            recordLocalMessage(UUID.randomUUID().toString(), text, "Chat", MessageStatus.FAILED, recipientIdHex, encrypted = true)
             return false
         }
-        outboundQueue.add(packet)
-        recordLocalMessage(text, "Chat", MessageStatus.QUEUED, recipientIdHex, encrypted = true)
+        outboundQueue.add(created.bytes)
+        recordLocalMessage(created.msgIdHex, text, "Chat", MessageStatus.QUEUED, recipientIdHex, encrypted = true)
         return true
     }
 
@@ -240,10 +254,11 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * never downgraded to plaintext.
      */
     fun sendGroupChat(groupIdHex: String, text: String): Boolean {
-        val packet = MeshCoreBridge.createGroupChat(groupIdHex, text)
-        if (packet == null) {
+        val created = createGroupChatPacketInvoker(groupIdHex, text)
+        if (created == null) {
             Log.w(TAG, "Group message not sent: no key for $groupIdHex.")
             recordLocalMessage(
+                UUID.randomUUID().toString(),
                 text,
                 "GroupChat",
                 MessageStatus.FAILED,
@@ -253,8 +268,9 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             )
             return false
         }
-        outboundQueue.add(packet)
+        outboundQueue.add(created.bytes)
         recordLocalMessage(
+            created.msgIdHex,
             text,
             "GroupChat",
             MessageStatus.QUEUED,
@@ -378,9 +394,6 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         while (true) {
             packets.add(outboundQueue.poll() ?: break)
         }
-        if (packets.isNotEmpty()) {
-            markQueuedAsSent()
-        }
         return packets
     }
 
@@ -413,7 +426,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         transport: String = "Bluetooth LE",
         directLinkRssi: Int? = null
     ) {
-        val json = MeshCoreBridge.processIncoming(rawPacket)
+        val json = processIncomingInvoker(rawPacket)
         if (json == null) {
             // Not an error worth surfacing: unverifiable traffic is expected on
             // an open radio and is simply not ours to act on.
@@ -455,7 +468,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
             when (packetType) {
                 "PublicSos" -> obj.optStringOrNull("sos_text")?.let { text ->
-                    upsertMessage(
+                    upsertIncomingMessage(
                         MessageEntity(
                             msgId = msgId,
                             senderId = senderId,
@@ -472,7 +485,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
                 "Chat" -> if (addressedToUs) {
                     obj.optStringOrNull("plaintext")?.let { text ->
-                        upsertMessage(
+                        upsertIncomingMessage(
                             MessageEntity(
                                 msgId = msgId,
                                 senderId = senderId,
@@ -496,7 +509,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
                     val groupId = obj.optStringOrNull("group_id")
                     val text = obj.optStringOrNull("plaintext")
                     if (groupId != null && text != null) {
-                        upsertMessage(
+                        upsertIncomingMessage(
                             MessageEntity(
                                 msgId = msgId,
                                 senderId = senderId,
@@ -524,7 +537,9 @@ class StoreAndForwardManager private constructor(private val context: Context) {
                 }
 
                 "Ack" -> if (addressedToUs) {
-                    markDelivered(msgId)
+                    obj.optStringOrNull("acked_message_id")?.let { ackedId ->
+                        markDelivered(ackedId)
+                    }
                 }
 
                 "ResourcePin" -> syncResourcePins()
@@ -655,6 +670,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     // -----------------------------------------------------------------------
 
     private fun recordLocalMessage(
+        msgId: String,
         text: String,
         packetType: String,
         status: MessageStatus,
@@ -664,7 +680,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     ) {
         upsertMessage(
             MessageEntity(
-                msgId = UUID.randomUUID().toString(),
+                msgId = msgId,
                 senderId = MessageEntity.LOCAL_SENDER,
                 recipientId = recipientId,
                 payloadText = text,
@@ -684,23 +700,53 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         schedulePersist()
     }
 
-    private fun markQueuedAsSent() {
-        var changed = false
-        messageStore.forEach { (id, msg) ->
-            if (msg.status == MessageStatus.QUEUED) {
-                messageStore[id] = msg.copy(status = MessageStatus.SENT)
-                changed = true
-            }
+    private fun upsertIncomingMessage(message: MessageEntity) {
+        val existing = messageStore[message.msgId]
+        if (existing != null && existing.isOutgoing) {
+            // An incoming packet (relay echo or hostile injection) must never overwrite
+            // our own outgoing message, change its sender, or mutate its payload/status.
+            return
         }
-        if (changed) publishMessages()
+        if (existing == null) {
+            messageStore[message.msgId] = message
+            publishMessages()
+            schedulePersist()
+        }
     }
 
-    private fun markDelivered(ackedMsgId: String) {
-        messageStore[ackedMsgId]?.let {
-            messageStore[ackedMsgId] = it.copy(status = MessageStatus.DELIVERED)
+    fun markSent(msgId: String) {
+        var changed = false
+        messageStore.computeIfPresent(msgId) { _, existing ->
+            if (existing.status == MessageStatus.QUEUED) {
+                changed = true
+                existing.copy(status = MessageStatus.SENT)
+            } else {
+                existing
+            }
+        }
+        if (changed) {
             publishMessages()
+            schedulePersist()
         }
     }
+
+    internal fun markDelivered(ackedMsgId: String) {
+        var changed = false
+        messageStore.computeIfPresent(ackedMsgId) { _, existing ->
+            if (existing.status != MessageStatus.DELIVERED) {
+                changed = true
+                existing.copy(status = MessageStatus.DELIVERED)
+            } else {
+                existing
+            }
+        }
+        if (changed) {
+            publishMessages()
+            schedulePersist()
+        }
+    }
+
+    fun getMessage(msgId: String): MessageEntity? = messageStore[msgId]
 
     private fun publishMessages() {
         _messagesFlow.value = messageStore.values.sortedBy { it.timestampMillis }
