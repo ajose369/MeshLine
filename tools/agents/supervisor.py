@@ -144,6 +144,7 @@ class LaneA:
         key = f"{action['kind']}:{action.get('pr') or action.get('task') or ''}"
         if self.recent[-3:] == [key] * 3:
             self.paused_until = time.time() + 3600
+            self.recent.clear()  # otherwise the lane re-pauses forever when the hour ends
             self.pause_reason = f"same action ({key}) dispatched 3 times without progress; paused 1h"
             say(self.pause_reason)
             return
