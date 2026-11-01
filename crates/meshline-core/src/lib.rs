@@ -84,8 +84,21 @@ pub struct GroupRekeyResult {
 /// What a receiver should do with a packet that passed verification.
 #[derive(Debug, Clone)]
 pub struct ReceiveOutcome {
-    /// The verified packet, with TTL already decremented for onward relay.
+    /// The verified packet, with TTL already decremented for onward relay. A
+    /// duplicate or a packet out of hops keeps its wire TTL, so this TTL cannot
+    /// say how far the packet came: use `hops_on_arrival` for that.
     pub packet: Packet,
+    /// Relays between the originator and this node, read from the TTL the packet
+    /// arrived with. `None` when that TTL is above [`DEFAULT_TTL`], which no
+    /// honest sender produces, so nothing can be concluded from it.
+    ///
+    /// TTL is not signed because relays must change it, so this is a claim made
+    /// by the last transmitter, not proof: a hostile relay can reset it and look
+    /// like the originator. Never treat it as authenticated.
+    pub hops_on_arrival: Option<u8>,
+    /// True when this node had already seen the packet's id. An id evicted from
+    /// the dedup cache reads as new, as it does for relaying.
+    pub is_duplicate: bool,
     /// True when this node should rebroadcast it.
     pub should_relay: bool,
     /// An ACK to send back. Only ever set for a chat this node decrypted, because
@@ -688,7 +701,9 @@ impl MeshNode {
             return Err(MeshError::RateLimited);
         }
 
-        // 5. Dedup and relay decision.
+        // 5. Dedup and relay decision. The relay decision decrements TTL only on
+        // some paths, so the hop count has to be read before it runs.
+        let hops_on_arrival = DEFAULT_TTL.checked_sub(packet.header.ttl);
         let relay_result = self.routing.should_relay(&mut packet);
         let is_duplicate = matches!(relay_result, Err(RoutingError::DuplicatePacket));
 
@@ -830,6 +845,8 @@ impl MeshNode {
 
         Ok(ReceiveOutcome {
             packet,
+            hops_on_arrival,
+            is_duplicate,
             should_relay,
             ack,
             acked_message_id,
@@ -978,6 +995,64 @@ mod tests {
         let hop2 = far.process_incoming(&wire(&hop1.packet)).unwrap();
         assert_eq!(hop2.packet.header.sender_id, sender.node_id);
         assert_eq!(hop2.packet.header.ttl, DEFAULT_TTL - 2);
+    }
+
+    #[test]
+    fn a_relayed_duplicate_is_not_mistaken_for_a_direct_packet() {
+        let sender = MeshNode::new();
+        let relay = MeshNode::new();
+        let receiver = MeshNode::new();
+        let sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
+
+        let direct = receiver.process_incoming(&wire(&sos)).unwrap();
+        assert_eq!(direct.hops_on_arrival, Some(0));
+        assert!(!direct.is_duplicate);
+
+        // The relay's copy carries the TTL the direct copy was just left with, so
+        // the reported TTL is identical and only the new fields tell them apart.
+        let relayed = relay.process_incoming(&wire(&sos)).unwrap();
+        let echo = receiver.process_incoming(&wire(&relayed.packet)).unwrap();
+        assert_eq!(echo.packet.header.ttl, direct.packet.header.ttl);
+        assert_eq!(echo.hops_on_arrival, Some(1));
+        assert!(echo.is_duplicate);
+    }
+
+    #[test]
+    fn hops_on_arrival_counts_relays_on_a_first_sighting() {
+        let sender = MeshNode::new();
+        let relay = MeshNode::new();
+        let far = MeshNode::new();
+        let sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
+
+        let hop1 = relay.process_incoming(&wire(&sos)).unwrap();
+        let hop2 = far.process_incoming(&wire(&hop1.packet)).unwrap();
+        assert_eq!(hop2.hops_on_arrival, Some(1));
+        assert!(!hop2.is_duplicate);
+    }
+
+    #[test]
+    fn hops_on_arrival_is_right_when_the_packet_has_no_hops_left() {
+        let sender = MeshNode::new();
+        let receiver = MeshNode::new();
+        let mut sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
+        sos.header.ttl = 1;
+
+        let last_hop = receiver.process_incoming(&wire(&sos)).unwrap();
+        assert!(!last_hop.should_relay);
+        assert_eq!(last_hop.hops_on_arrival, Some(DEFAULT_TTL - 1));
+    }
+
+    #[test]
+    fn a_ttl_above_the_default_claims_no_hop_count() {
+        let sender = MeshNode::new();
+        let receiver = MeshNode::new();
+        let mut sos = sender.create_public_sos("help", at(12.9, 77.5)).unwrap();
+        sos.header.ttl = DEFAULT_TTL + 1;
+
+        // TTL is unsigned, so the packet is still accepted, but it must not read
+        // as direct the way a saturating subtraction would make it.
+        let outcome = receiver.process_incoming(&wire(&sos)).unwrap();
+        assert_eq!(outcome.hops_on_arrival, None);
     }
 
     #[test]

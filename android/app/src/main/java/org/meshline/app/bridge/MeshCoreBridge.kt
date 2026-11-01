@@ -272,6 +272,12 @@ object MeshCoreBridge {
      * For an ACK, mark `acked_message_id` delivered, and only when it is present:
      * the core sets it only for an ACK signed by the node the message was sent
      * to. `msg_id` is the ACK packet's own id and matches no message.
+     *
+     * For how far a packet came, read `hops_on_arrival` (0 = no relays), never
+     * `ttl`, which is decremented on some paths and not others. The field is
+     * absent when unknown, so treat a missing value as not direct. `is_duplicate`
+     * says this device had already seen the packet. TTL is unsigned, so hops are a
+     * claim by the last transmitter: a hostile relay can look like the originator.
      */
     fun processIncoming(rawPacket: ByteArray): String? =
         guarded { nativeProcessIncoming(rawPacket) }
