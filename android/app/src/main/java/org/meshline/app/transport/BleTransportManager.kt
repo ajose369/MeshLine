@@ -88,7 +88,8 @@ class BleTransportManager(private val context: Context) {
         @Volatile var submittedIndex: Int = -1,
         @Volatile var acknowledgedIndex: Int = -1,
         val characteristic: BluetoothGattCharacteristic,
-        var timeoutRunnable: Runnable? = null
+        var timeoutRunnable: Runnable? = null,
+        val peerAddress: String? = null
     ) {
         /**
          * Returns the index of the first packet that was not fully acknowledged.
@@ -170,6 +171,10 @@ class BleTransportManager(private val context: Context) {
 
     internal var closeInvoker: (gatt: BluetoothGatt) -> Unit =
         ::defaultClose
+
+    internal var characteristicResolver: (gatt: BluetoothGatt) -> BluetoothGattCharacteristic? = { gatt ->
+        gatt.getService(MESHLINE_SERVICE_UUID)?.getCharacteristic(MESHLINE_CHAR_UUID)
+    }
 
     /** Negotiated ATT MTU per peer, until one is agreed. */
     private val negotiatedMtu = ConcurrentHashMap<String, Int>()
@@ -421,8 +426,7 @@ class BleTransportManager(private val context: Context) {
                 return
             }
 
-            val characteristic = gatt.getService(MESHLINE_SERVICE_UUID)
-                ?.getCharacteristic(MESHLINE_CHAR_UUID)
+            val characteristic = characteristicResolver(gatt)
             if (characteristic == null) {
                 if (address != null) {
                     connectedDevices.remove(address)
@@ -437,7 +441,7 @@ class BleTransportManager(private val context: Context) {
                 return
             }
 
-            val packets = StoreAndForwardManager.getInstance(context).drainOutbound()
+            val packets = StoreAndForwardManager.getInstance(context).getOutboundPacketsForPeer(address)
             if (packets.isEmpty()) {
                 disconnectQuietly(gatt)
                 return
@@ -467,7 +471,8 @@ class BleTransportManager(private val context: Context) {
                 frames = frames,
                 submittedIndex = -1,
                 acknowledgedIndex = -1,
-                characteristic = characteristic
+                characteristic = characteristic,
+                peerAddress = address
             )
             writeStates[address] = state
             sendNextFrame(gatt, state)
@@ -504,6 +509,18 @@ class BleTransportManager(private val context: Context) {
 
             // Mark the submitted frame as successfully acknowledged
             state.acknowledgedIndex = state.submittedIndex
+
+            // If this frame completed transmission of a whole packet, record it in custody for this peer
+            val ackedIdx = state.acknowledgedIndex
+            if (ackedIdx in state.frames.indices) {
+                val currentPacketIdx = state.frames[ackedIdx].packetIndex
+                val isLastFrameOfPacket = ackedIdx + 1 == state.frames.size ||
+                    state.frames[ackedIdx + 1].packetIndex > currentPacketIdx
+                if (isLastFrameOfPacket && currentPacketIdx in state.packets.indices) {
+                    val packet = state.packets[currentPacketIdx]
+                    StoreAndForwardManager.getInstance(context).markPacketDeliveredToPeer(packet, address)
+                }
+            }
 
             // If this was the last frame of the entire queue, finish and disconnect
             if (state.acknowledgedIndex >= state.frames.size - 1) {
@@ -738,11 +755,13 @@ class BleTransportManager(private val context: Context) {
 
                 if (packet != null) {
                     val directRssi = if (deviceKey != "unknown") deviceRssi[deviceKey] else null
+                    val sourceAddr = if (deviceKey != "unknown") deviceKey else null
                     StoreAndForwardManager.getInstance(context)
                         .processIncomingPacket(
                             packet,
                             transport = "Bluetooth LE",
-                            directLinkRssi = directRssi
+                            directLinkRssi = directRssi,
+                            sourceAddress = sourceAddr
                         )
                 }
             }

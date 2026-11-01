@@ -3,6 +3,8 @@ package org.meshline.app.db
 import android.content.Context
 import android.util.Log
 import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -54,6 +56,46 @@ data class GroupRekeyReport(
 }
 
 /**
+ * A packet retained in local custody for store-and-forward mesh propagation.
+ *
+ * Packets stay in local custody independently of individual BLE connections.
+ * Bounded fan-out ensures each connected neighbour receives the packet once,
+ * while preventing packets from being handed back to the neighbour that supplied them.
+ */
+data class CustodyPacket(
+    val packetId: String,
+    val bytes: ByteArray,
+    val sourceAddress: String? = null,
+    val createdAtMillis: Long = System.currentTimeMillis(),
+    val expiryMillis: Long = createdAtMillis + StoreAndForwardManager.DEFAULT_CUSTODY_TTL_MILLIS,
+    val deliveredPeers: MutableSet<String> = Collections.synchronizedSet(mutableSetOf<String>())
+) {
+    fun isExpired(nowMillis: Long = System.currentTimeMillis()): Boolean =
+        nowMillis >= expiryMillis
+
+    fun isEligibleForPeer(peerAddress: String, nowMillis: Long = System.currentTimeMillis()): Boolean {
+        if (isExpired(nowMillis)) return false
+        val normalized = peerAddress.uppercase()
+        if (sourceAddress != null && sourceAddress.uppercase() == normalized) return false
+        return !deliveredPeers.any { it.uppercase() == normalized }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is CustodyPacket) return false
+        return packetId == other.packetId
+    }
+
+    override fun hashCode(): Int = packetId.hashCode()
+}
+
+internal fun packetHash(bytes: ByteArray): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    val digest = md.digest(bytes)
+    return digest.joinToString("") { "%02x".format(it) }
+}
+
+/**
  * Custody store for messages, pins, and peers.
  *
  * Everything in here originates from a packet the native core has already
@@ -68,7 +110,8 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     private val pinStore = ConcurrentHashMap<String, ResourcePinEntity>()
     private val peerStore = ConcurrentHashMap<String, PeerNodeEntity>()
     private val groupStore = ConcurrentHashMap<String, GroupEntity>()
-    private val outboundQueue = ConcurrentLinkedQueue<ByteArray>()
+    private val custodyStore = ConcurrentHashMap<String, CustodyPacket>()
+    private val custodyOrder = ConcurrentLinkedQueue<String>()
 
     private val _messagesFlow = MutableStateFlow<List<MessageEntity>>(emptyList())
     val messagesFlow: StateFlow<List<MessageEntity>> = _messagesFlow.asStateFlow()
@@ -107,11 +150,20 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         syncGroups()
     }
 
+    internal var processIncomingInvoker: (ByteArray) -> String? =
+        MeshCoreBridge::processIncoming
+
     companion object {
         private const val TAG = "MeshStore"
 
         /** Peers unheard from for this long stop being shown as in range. */
         private const val PEER_STALE_MILLIS = 5 * 60 * 1000L
+
+        /** Default custody time-to-live for packets held for mesh propagation (10 minutes). */
+        const val DEFAULT_CUSTODY_TTL_MILLIS = 10 * 60 * 1000L
+
+        /** Maximum number of packets retained in custody. */
+        const val MAX_CUSTODY_PACKETS = 256
 
         @Volatile
         private var INSTANCE: StoreAndForwardManager? = null
@@ -121,6 +173,11 @@ class StoreAndForwardManager private constructor(private val context: Context) {
                 INSTANCE ?: StoreAndForwardManager(context.applicationContext)
                     .also { INSTANCE = it }
             }
+
+        @androidx.annotation.VisibleForTesting
+        fun resetForTesting() {
+            INSTANCE = null
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -145,7 +202,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             recordLocalMessage(text, "PublicSos", MessageStatus.FAILED)
             return false
         }
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         recordLocalMessage(text, "PublicSos", MessageStatus.QUEUED)
         return true
     }
@@ -162,7 +219,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             recordLocalMessage(text, "Chat", MessageStatus.FAILED, recipientIdHex, encrypted = true)
             return false
         }
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         recordLocalMessage(text, "Chat", MessageStatus.QUEUED, recipientIdHex, encrypted = true)
         return true
     }
@@ -170,7 +227,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     /** Starts a Noise handshake so chat with this peer becomes possible. */
     fun startHandshake(peerIdHex: String): Boolean {
         val packet = MeshCoreBridge.beginHandshake(peerIdHex) ?: return false
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         return true
     }
 
@@ -228,7 +285,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             Log.w(TAG, "Invite not sent: no session with $peerIdHex, or not the group admin.")
             return false
         }
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         syncGroups()
         schedulePersist()
         return true
@@ -253,7 +310,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             )
             return false
         }
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         recordLocalMessage(
             text,
             "GroupChat",
@@ -286,7 +343,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             val obj = JSONObject(json)
             val packets = obj.getJSONArray("invite_packets_hex")
             for (i in 0 until packets.length()) {
-                outboundQueue.add(packets.getString(i).hexToBytes())
+                addCustodyPacket(packets.getString(i).hexToBytes(), sourceAddress = null)
             }
             val unreachableArray = obj.getJSONArray("unreachable")
             val unreachable = (0 until unreachableArray.length())
@@ -367,16 +424,110 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             return false
         }
 
-        outboundQueue.add(packet)
+        addCustodyPacket(packet, sourceAddress = null)
         syncResourcePins()
         return true
     }
 
-    /** Drains everything waiting to be transmitted. */
+    /**
+     * Enqueues or refreshes a packet in local custody.
+     * If already present, the existing custody record is retained.
+     */
+    fun addCustodyPacket(
+        packet: ByteArray,
+        sourceAddress: String? = null,
+        ttlMillis: Long = DEFAULT_CUSTODY_TTL_MILLIS
+    ): CustodyPacket {
+        pruneExpiredCustody()
+        val id = packetHash(packet)
+        val existing = custodyStore[id]
+        if (existing != null) {
+            return existing
+        }
+        if (custodyStore.size >= MAX_CUSTODY_PACKETS) {
+            val oldest = custodyOrder.poll()
+            if (oldest != null) {
+                custodyStore.remove(oldest)
+            }
+        }
+        val now = System.currentTimeMillis()
+        val cp = CustodyPacket(
+            packetId = id,
+            bytes = packet,
+            sourceAddress = sourceAddress,
+            createdAtMillis = now,
+            expiryMillis = now + ttlMillis
+        )
+        custodyStore[id] = cp
+        custodyOrder.add(id)
+        return cp
+    }
+
+    /**
+     * Returns all packets in custody that are eligible to be transmitted to [peerAddress].
+     * Excludes expired packets, packets already delivered to this peer, and packets
+     * that were originally supplied by this peer (flood fan-out without echoes).
+     */
+    fun getOutboundPacketsForPeer(peerAddress: String): List<ByteArray> {
+        pruneExpiredCustody()
+        val now = System.currentTimeMillis()
+        val result = mutableListOf<ByteArray>()
+        for (id in custodyOrder) {
+            val cp = custodyStore[id] ?: continue
+            if (cp.isEligibleForPeer(peerAddress, now)) {
+                result.add(cp.bytes)
+            }
+        }
+        return result
+    }
+
+    /**
+     * Records that [peerAddress] has fully received [packet], so it is not
+     * retransmitted to this peer on subsequent connections.
+     */
+    fun markPacketDeliveredToPeer(packet: ByteArray, peerAddress: String) {
+        val id = packetHash(packet)
+        val cp = custodyStore[id] ?: return
+        cp.deliveredPeers.add(peerAddress.uppercase())
+        markQueuedAsSent()
+    }
+
+    fun isPacketDeliveredToPeer(packet: ByteArray, peerAddress: String): Boolean {
+        val id = packetHash(packet)
+        val cp = custodyStore[id] ?: return false
+        return cp.deliveredPeers.any { it.equals(peerAddress, ignoreCase = true) }
+    }
+
+    fun getCustodyPacket(packet: ByteArray): CustodyPacket? {
+        val id = packetHash(packet)
+        return custodyStore[id]
+    }
+
+    fun pruneExpiredCustody(nowMillis: Long = System.currentTimeMillis()) {
+        val it = custodyStore.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (entry.value.isExpired(nowMillis)) {
+                it.remove()
+            }
+        }
+        custodyOrder.removeIf { !custodyStore.containsKey(it) }
+    }
+
+    fun clearCustody() {
+        custodyStore.clear()
+        custodyOrder.clear()
+    }
+
+    /** Drains everything waiting to be transmitted. Primarily for tests. */
     fun drainOutbound(): List<ByteArray> {
         val packets = mutableListOf<ByteArray>()
         while (true) {
-            packets.add(outboundQueue.poll() ?: break)
+            val id = custodyOrder.poll() ?: break
+            val cp = custodyStore.remove(id) ?: continue
+            if (!cp.isExpired()) {
+                packets.add(cp.bytes)
+            }
         }
         if (packets.isNotEmpty()) {
             markQueuedAsSent()
@@ -384,11 +535,24 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         return packets
     }
 
-    fun queueRawPacket(packet: ByteArray) {
-        outboundQueue.add(packet)
+    fun queueRawPacket(packet: ByteArray, sourceAddress: String? = null) {
+        addCustodyPacket(packet, sourceAddress)
     }
 
-    fun hasPendingOutbound(): Boolean = outboundQueue.isNotEmpty()
+    fun hasPendingOutbound(): Boolean {
+        pruneExpiredCustody()
+        return custodyStore.isNotEmpty()
+    }
+
+    fun hasPendingOutboundForPeer(peerAddress: String): Boolean {
+        pruneExpiredCustody()
+        val now = System.currentTimeMillis()
+        for (id in custodyOrder) {
+            val cp = custodyStore[id] ?: continue
+            if (cp.isEligibleForPeer(peerAddress, now)) return true
+        }
+        return false
+    }
 
     /**
      * How many packets this device is still holding for the mesh.
@@ -397,7 +561,10 @@ class StoreAndForwardManager private constructor(private val context: Context) {
      * of a user: a non-zero count means their phone is carrying someone else's
      * traffic and walking away from the crowd throws it away.
      */
-    fun pendingOutboundCount(): Int = outboundQueue.size
+    fun pendingOutboundCount(): Int {
+        pruneExpiredCustody()
+        return custodyStore.size
+    }
 
     // -----------------------------------------------------------------------
     // Inbound
@@ -411,9 +578,10 @@ class StoreAndForwardManager private constructor(private val context: Context) {
     fun processIncomingPacket(
         rawPacket: ByteArray,
         transport: String = "Bluetooth LE",
-        directLinkRssi: Int? = null
+        directLinkRssi: Int? = null,
+        sourceAddress: String? = null
     ) {
-        val json = MeshCoreBridge.processIncoming(rawPacket)
+        val json = processIncomingInvoker(rawPacket)
         if (json == null) {
             // Not an error worth surfacing: unverifiable traffic is expected on
             // an open radio and is simply not ours to act on.
@@ -430,9 +598,10 @@ class StoreAndForwardManager private constructor(private val context: Context) {
             val addressedToUs = obj.getBoolean("addressed_to_us")
 
             // Anything that needs to go back out.
-            obj.optStringOrNull("relay_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
-            obj.optStringOrNull("ack_packet_hex")?.let { outboundQueue.add(it.hexToBytes()) }
-            obj.optStringOrNull("handshake_reply_hex")?.let { outboundQueue.add(it.hexToBytes()) }
+            // Relayed packets record their source neighbor to prevent echo fan-out back to supplier.
+            obj.optStringOrNull("relay_packet_hex")?.let { addCustodyPacket(it.hexToBytes(), sourceAddress = sourceAddress) }
+            obj.optStringOrNull("ack_packet_hex")?.let { addCustodyPacket(it.hexToBytes(), sourceAddress = null) }
+            obj.optStringOrNull("handshake_reply_hex")?.let { addCustodyPacket(it.hexToBytes(), sourceAddress = null) }
 
             // Classify transport hop evidence fail-closed (B-RFC-001, REVIEW H13).
             // Without explicit core confirmation via hops_on_arrival == 0, no packet
@@ -769,7 +938,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         messageStore.clear()
         groupStore.clear()
         peerStore.clear()
-        outboundQueue.clear()
+        clearCustody()
 
         EncryptedMessageStore.wipe(context)
         SecureStateStore.wipe(context)
