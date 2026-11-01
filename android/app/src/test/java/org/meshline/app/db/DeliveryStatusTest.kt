@@ -313,4 +313,139 @@ class DeliveryStatusTest {
         assertEquals(MessageStatus.DELIVERED, restored["m3"]?.status)
         assertEquals(MessageStatus.FAILED, restored["m4"]?.status)
     }
+
+    @Test
+    fun `inbound echo of own SOS does not overwrite outgoing record or change sender`() {
+        val sosId = "own_sos_11223344556677889900aabb"
+        store.createSosPacketInvoker = { text, lat, lon, acc ->
+            MeshCoreBridge.CreatedPacket(sosId, byteArrayOf(1, 2, 3))
+        }
+
+        assertTrue(store.sendSos("SOS: local emergency", 10.0, 20.0, 5.0f))
+        store.markSent(sosId)
+        val outgoing = store.getMessage(sosId)
+        assertNotNull(outgoing)
+        assertTrue(outgoing!!.isOutgoing)
+        assertEquals(MessageEntity.LOCAL_SENDER, outgoing.senderId)
+        assertEquals(MessageStatus.SENT, outgoing.status)
+
+        // Simulated echo arriving from neighbour
+        store.processIncomingInvoker = {
+            """
+            {
+                "packet_type": "PublicSos",
+                "sender_id": "neighbour_relayed_node",
+                "msg_id": "$sosId",
+                "ttl": 7,
+                "timestamp": 1700000000,
+                "addressed_to_us": false,
+                "sos_text": "SOS: local emergency"
+            }
+            """.trimIndent()
+        }
+
+        store.processIncomingPacket(byteArrayOf(1, 2, 3))
+
+        val afterEcho = store.getMessage(sosId)
+        assertNotNull(afterEcho)
+        assertEquals("Sender must remain LOCAL_SENDER after echo", MessageEntity.LOCAL_SENDER, afterEcho!!.senderId)
+        assertTrue("isOutgoing must remain true after echo", afterEcho.isOutgoing)
+        assertEquals("Payload must be unchanged", "SOS: local emergency", afterEcho.payloadText)
+        assertEquals("Status must remain SENT", MessageStatus.SENT, afterEcho.status)
+    }
+
+    @Test
+    fun `inbound echo of own group chat does not overwrite outgoing record or change sender`() {
+        val groupId = "group_12345"
+        val groupMsgId = "own_group_msg_1122334455667788"
+        store.createGroupChatPacketInvoker = { gId, text ->
+            MeshCoreBridge.CreatedPacket(groupMsgId, byteArrayOf(4, 5, 6))
+        }
+
+        assertTrue(store.sendGroupChat(groupId, "Hello group from me"))
+        val outgoing = store.getMessage(groupMsgId)
+        assertNotNull(outgoing)
+        assertTrue(outgoing!!.isOutgoing)
+        assertEquals(MessageStatus.QUEUED, outgoing.status)
+
+        // Simulated echo arriving from mesh
+        store.processIncomingInvoker = {
+            """
+            {
+                "packet_type": "GroupChat",
+                "sender_id": "mesh_node_relayer",
+                "msg_id": "$groupMsgId",
+                "group_id": "$groupId",
+                "ttl": 6,
+                "timestamp": 1700000000,
+                "addressed_to_us": false,
+                "plaintext": "Hello group from me"
+            }
+            """.trimIndent()
+        }
+
+        store.processIncomingPacket(byteArrayOf(4, 5, 6))
+
+        val afterEcho = store.getMessage(groupMsgId)
+        assertNotNull(afterEcho)
+        assertEquals("Sender must remain LOCAL_SENDER", MessageEntity.LOCAL_SENDER, afterEcho!!.senderId)
+        assertTrue("isOutgoing must remain true", afterEcho.isOutgoing)
+        assertEquals("Payload must be unchanged", "Hello group from me", afterEcho.payloadText)
+        assertEquals("Status must remain QUEUED", MessageStatus.QUEUED, afterEcho.status)
+    }
+
+    @Test
+    fun `foreign packet reusing outgoing msg_id is dropped and does not overwrite message text or status`() {
+        val chatMsgId = "own_chat_msg_1122334455667788"
+        store.createChatPacketInvoker = { recipient, text ->
+            MeshCoreBridge.CreatedPacket(chatMsgId, byteArrayOf(7, 8, 9))
+        }
+
+        assertTrue(store.sendChat("recipient_alice", "Original private text"))
+        store.markSent(chatMsgId)
+
+        // Hostile / spoofed packet arriving with same msgId and tampered text
+        store.processIncomingInvoker = {
+            """
+            {
+                "packet_type": "Chat",
+                "sender_id": "attacker_eve",
+                "msg_id": "$chatMsgId",
+                "ttl": 7,
+                "timestamp": 1700000000,
+                "addressed_to_us": true,
+                "plaintext": "Attacker replaced payload text!"
+            }
+            """.trimIndent()
+        }
+
+        store.processIncomingPacket(byteArrayOf(7, 8, 9))
+
+        val afterHostile = store.getMessage(chatMsgId)
+        assertNotNull(afterHostile)
+        assertEquals("Sender must remain LOCAL_SENDER", MessageEntity.LOCAL_SENDER, afterHostile!!.senderId)
+        assertTrue("isOutgoing must remain true", afterHostile.isOutgoing)
+        assertEquals("Payload text must not be overwritten", "Original private text", afterHostile.payloadText)
+        assertEquals("Status must not be mutated", MessageStatus.SENT, afterHostile.status)
+    }
+
+    @Test
+    fun `markSent does not downgrade DELIVERED status in a concurrent write race`() {
+        val msgId = "race_msg_11223344556677889900"
+        store.createChatPacketInvoker = { _, _ ->
+            MeshCoreBridge.CreatedPacket(msgId, byteArrayOf(1, 1, 1))
+        }
+
+        assertTrue(store.sendChat("peer", "Test race"))
+        assertEquals(MessageStatus.QUEUED, store.getMessage(msgId)?.status)
+
+        // ACK arrives and marks delivered first
+        store.markDelivered(msgId)
+        assertEquals(MessageStatus.DELIVERED, store.getMessage(msgId)?.status)
+
+        // Late markSent completion callback must not downgrade DELIVERED to SENT
+        store.markSent(msgId)
+        assertEquals("markSent must not downgrade DELIVERED to SENT", MessageStatus.DELIVERED, store.getMessage(msgId)?.status)
+    }
 }
+

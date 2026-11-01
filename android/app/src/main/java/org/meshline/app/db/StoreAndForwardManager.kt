@@ -468,7 +468,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
             when (packetType) {
                 "PublicSos" -> obj.optStringOrNull("sos_text")?.let { text ->
-                    upsertMessage(
+                    upsertIncomingMessage(
                         MessageEntity(
                             msgId = msgId,
                             senderId = senderId,
@@ -485,7 +485,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
 
                 "Chat" -> if (addressedToUs) {
                     obj.optStringOrNull("plaintext")?.let { text ->
-                        upsertMessage(
+                        upsertIncomingMessage(
                             MessageEntity(
                                 msgId = msgId,
                                 senderId = senderId,
@@ -509,7 +509,7 @@ class StoreAndForwardManager private constructor(private val context: Context) {
                     val groupId = obj.optStringOrNull("group_id")
                     val text = obj.optStringOrNull("plaintext")
                     if (groupId != null && text != null) {
-                        upsertMessage(
+                        upsertIncomingMessage(
                             MessageEntity(
                                 msgId = msgId,
                                 senderId = senderId,
@@ -700,19 +700,47 @@ class StoreAndForwardManager private constructor(private val context: Context) {
         schedulePersist()
     }
 
+    private fun upsertIncomingMessage(message: MessageEntity) {
+        val existing = messageStore[message.msgId]
+        if (existing != null && existing.isOutgoing) {
+            // An incoming packet (relay echo or hostile injection) must never overwrite
+            // our own outgoing message, change its sender, or mutate its payload/status.
+            return
+        }
+        if (existing == null) {
+            messageStore[message.msgId] = message
+            publishMessages()
+            schedulePersist()
+        }
+    }
+
     fun markSent(msgId: String) {
-        val existing = messageStore[msgId] ?: return
-        if (existing.status == MessageStatus.QUEUED) {
-            messageStore[msgId] = existing.copy(status = MessageStatus.SENT)
+        var changed = false
+        messageStore.computeIfPresent(msgId) { _, existing ->
+            if (existing.status == MessageStatus.QUEUED) {
+                changed = true
+                existing.copy(status = MessageStatus.SENT)
+            } else {
+                existing
+            }
+        }
+        if (changed) {
             publishMessages()
             schedulePersist()
         }
     }
 
     internal fun markDelivered(ackedMsgId: String) {
-        val existing = messageStore[ackedMsgId] ?: return
-        if (existing.status != MessageStatus.DELIVERED) {
-            messageStore[ackedMsgId] = existing.copy(status = MessageStatus.DELIVERED)
+        var changed = false
+        messageStore.computeIfPresent(ackedMsgId) { _, existing ->
+            if (existing.status != MessageStatus.DELIVERED) {
+                changed = true
+                existing.copy(status = MessageStatus.DELIVERED)
+            } else {
+                existing
+            }
+        }
+        if (changed) {
             publishMessages()
             schedulePersist()
         }
