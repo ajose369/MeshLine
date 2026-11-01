@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use meshline_core::{
     node_id_from_pubkey, BatteryPowerState, GroupRekeyResult, InviteOutcome, LocationTag, MeshNode,
-    Packet, PacketType, ResourcePinType,
+    Packet, PacketType, ReceiveOutcome, ResourcePinType,
 };
 
 static NODE_INSTANCE: Mutex<Option<MeshNode>> = Mutex::new(None);
@@ -788,6 +788,13 @@ struct ReceiveResultJson {
     msg_id: String,
     timestamp: u64,
     ttl: u8,
+    /// Relays before this node, from the TTL the packet arrived with. Left out,
+    /// not null, when the TTL is above the default, so a reader treats it like an
+    /// older core: unknown. Unsigned, so a claim by the last transmitter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hops_on_arrival: Option<u8>,
+    /// True when this device had already seen the packet's id.
+    is_duplicate: bool,
     addressed_to_us: bool,
     should_relay: bool,
     latitude: Option<f32>,
@@ -837,6 +844,51 @@ fn invite_outcome_name(outcome: &InviteOutcome) -> &'static str {
     }
 }
 
+fn receive_result_json(outcome: ReceiveOutcome) -> ReceiveResultJson {
+    let header = &outcome.packet.header;
+    let sos_text = if header.packet_type == PacketType::PublicSos {
+        String::from_utf8(outcome.packet.payload.clone()).ok()
+    } else {
+        None
+    };
+
+    ReceiveResultJson {
+        verified: true,
+        packet_type: packet_type_name(header.packet_type),
+        sender_id: to_hex(&header.sender_id),
+        msg_id: to_hex(&header.msg_id),
+        timestamp: header.timestamp,
+        ttl: header.ttl,
+        hops_on_arrival: outcome.hops_on_arrival,
+        is_duplicate: outcome.is_duplicate,
+        addressed_to_us: outcome.addressed_to_us,
+        should_relay: outcome.should_relay,
+        latitude: header.location.as_ref().map(|l| l.latitude),
+        longitude: header.location.as_ref().map(|l| l.longitude),
+        relay_packet_hex: if outcome.should_relay {
+            outcome.packet.to_bytes().ok().map(|b| to_hex(&b))
+        } else {
+            None
+        },
+        ack_packet_hex: outcome
+            .ack
+            .as_ref()
+            .and_then(|p| p.to_bytes().ok())
+            .map(|b| to_hex(&b)),
+        acked_message_id: outcome.acked_message_id.as_ref().map(|m| to_hex(m)),
+        handshake_reply_hex: outcome
+            .handshake_reply
+            .as_ref()
+            .and_then(|p| p.to_bytes().ok())
+            .map(|b| to_hex(&b)),
+        plaintext: outcome.plaintext.and_then(|p| String::from_utf8(p).ok()),
+        sos_text,
+        group_id: outcome.group_id.as_ref().map(|g| to_hex(g)),
+        group_name: outcome.group_name.clone(),
+        group_event: outcome.group_event.as_ref().map(invite_outcome_name),
+    }
+}
+
 /// Verifies and processes an inbound frame.
 ///
 /// Returns a JSON description of what to do next, or null if the packet failed
@@ -859,48 +911,7 @@ pub extern "system" fn Java_org_meshline_app_bridge_MeshCoreBridge_nativeProcess
             Err(_) => return std::ptr::null_mut(),
         };
 
-        let header = &outcome.packet.header;
-        let sos_text = if header.packet_type == PacketType::PublicSos {
-            String::from_utf8(outcome.packet.payload.clone()).ok()
-        } else {
-            None
-        };
-
-        let result = ReceiveResultJson {
-            verified: true,
-            packet_type: packet_type_name(header.packet_type),
-            sender_id: to_hex(&header.sender_id),
-            msg_id: to_hex(&header.msg_id),
-            timestamp: header.timestamp,
-            ttl: header.ttl,
-            addressed_to_us: outcome.addressed_to_us,
-            should_relay: outcome.should_relay,
-            latitude: header.location.as_ref().map(|l| l.latitude),
-            longitude: header.location.as_ref().map(|l| l.longitude),
-            relay_packet_hex: if outcome.should_relay {
-                outcome.packet.to_bytes().ok().map(|b| to_hex(&b))
-            } else {
-                None
-            },
-            ack_packet_hex: outcome
-                .ack
-                .as_ref()
-                .and_then(|p| p.to_bytes().ok())
-                .map(|b| to_hex(&b)),
-            acked_message_id: outcome.acked_message_id.as_ref().map(|m| to_hex(m)),
-            handshake_reply_hex: outcome
-                .handshake_reply
-                .as_ref()
-                .and_then(|p| p.to_bytes().ok())
-                .map(|b| to_hex(&b)),
-            plaintext: outcome.plaintext.and_then(|p| String::from_utf8(p).ok()),
-            sos_text,
-            group_id: outcome.group_id.as_ref().map(|g| to_hex(g)),
-            group_name: outcome.group_name.clone(),
-            group_event: outcome.group_event.as_ref().map(invite_outcome_name),
-        };
-
-        json_out(&mut env, &result)
+        json_out(&mut env, &receive_result_json(outcome))
     })
 }
 
@@ -1022,6 +1033,42 @@ mod tests {
     fn garbage_has_no_packet_id() {
         assert_eq!(packet_id_hex(&[]), None);
         assert_eq!(packet_id_hex(&[0xA5; 64]), None);
+    }
+
+    #[test]
+    fn receive_json_reports_hops_and_duplicates() {
+        let sender = MeshNode::new();
+        let relay = MeshNode::new();
+        let receiver = MeshNode::new();
+        let sos = sender.create_public_sos("help", None).unwrap();
+        let on_wire = sos.to_bytes().unwrap();
+
+        let direct = receiver.process_incoming(&on_wire).unwrap();
+        let json = serde_json::to_value(receive_result_json(direct)).unwrap();
+        assert_eq!(json["hops_on_arrival"], 0);
+        assert_eq!(json["is_duplicate"], false);
+
+        let relayed = relay.process_incoming(&on_wire).unwrap();
+        let echo = receiver
+            .process_incoming(&relayed.packet.to_bytes().unwrap())
+            .unwrap();
+        let json = serde_json::to_value(receive_result_json(echo)).unwrap();
+        assert_eq!(json["hops_on_arrival"], 1);
+        assert_eq!(json["is_duplicate"], true);
+    }
+
+    #[test]
+    fn receive_json_omits_an_unknown_hop_count() {
+        let sender = MeshNode::new();
+        let receiver = MeshNode::new();
+        let mut sos = sender.create_public_sos("help", None).unwrap();
+        sos.header.ttl = u8::MAX;
+
+        // Omitted rather than null: `has` then `getInt` in the app would throw on
+        // a JSON null and drop the SOS, for anyone who edited this unsigned byte.
+        let outcome = receiver.process_incoming(&sos.to_bytes().unwrap()).unwrap();
+        let json = serde_json::to_value(receive_result_json(outcome)).unwrap();
+        assert!(json.get("hops_on_arrival").is_none());
     }
 
     #[test]

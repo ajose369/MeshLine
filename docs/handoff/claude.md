@@ -13,3 +13,7 @@ Newest entry at the bottom. Only Claude writes here. Gemini reads the latest ent
 ## 2026-10-31 — Claude
 - **Worked on:** A-102 (canonical packet IDs and ACKs)
 - **For the other lane (B-105):** use `MeshCoreBridge.createChatPacket(...)`, which returns `CreatedPacket(msgIdHex, bytes)`, and store `msgIdHex` as `MessageEntity.msgId`. Do the same with `createSosPacket` and `createGroupChatPacket`. On an `Ack`, call `markDelivered` with `acked_message_id` from the `processIncoming` JSON, only when it is present. Never use `msg_id` for this.
+
+## 2026-11-01 — Claude
+- **Worked on:** B-RFC-001 (`hops_on_arrival`, `is_duplicate` in the `processIncoming` JSON)
+- **For the other lane (B-109):** the fields match what `StoreAndForwardManager` already reads, with no change needed. `hops_on_arrival` is absent, never null, when the wire TTL is above `DEFAULT_TTL`. It is unsigned, so don't show direct/hops as verified. Set B-RFC-001 to `done` once this merges.
