@@ -21,13 +21,18 @@ use super::CryptoError;
 
 /// Format version, so a future layout change is rejected loudly rather than
 /// misparsed into something that looks like valid key material.
-pub const VAULT_VERSION: u8 = 1;
+pub const VAULT_VERSION: u8 = 2;
+
+/// The layout before sessions carried a nonce reservation. Still readable, so an
+/// update keeps its sessions; never written.
+pub const LEGACY_VAULT_VERSION: u8 = 1;
 
 /// Bound on a sealed blob, to stop a corrupt or hostile file from sizing an
 /// allocation. Generous enough for the maximum number of sessions and groups.
 pub const MAX_VAULT_BYTES: usize = 1024 * 1024;
 
-const VAULT_AAD: &[u8] = b"meshline/vault/v1";
+const VAULT_AAD: &[u8] = b"meshline/vault/v2";
+const LEGACY_VAULT_AAD: &[u8] = b"meshline/vault/v1";
 const NONCE_LEN: usize = 24;
 
 /// Seals `plaintext` under `key`. Output is `version || nonce || ciphertext`.
@@ -62,15 +67,23 @@ pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
 /// the state is unusable. Nothing partial is ever returned, because half a
 /// session table is worse than none.
 pub fn open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    open_versioned(key, blob).map(|(_, plaintext)| plaintext)
+}
+
+/// [`open`], also saying which layout the plaintext is in.
+pub fn open_versioned(key: &[u8; 32], blob: &[u8]) -> Result<(u8, Vec<u8>), CryptoError> {
     if blob.len() > MAX_VAULT_BYTES {
         return Err(CryptoError::MessageTooLarge);
     }
     if blob.len() < 1 + NONCE_LEN + 16 {
         return Err(CryptoError::VaultCorrupt);
     }
-    if blob[0] != VAULT_VERSION {
-        return Err(CryptoError::VaultVersion);
-    }
+    let version = blob[0];
+    let aad = match version {
+        VAULT_VERSION => VAULT_AAD,
+        LEGACY_VAULT_VERSION => LEGACY_VAULT_AAD,
+        _ => return Err(CryptoError::VaultVersion),
+    };
 
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
@@ -78,10 +91,30 @@ pub fn open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
             XNonce::from_slice(&blob[1..1 + NONCE_LEN]),
             Payload {
                 msg: &blob[1 + NONCE_LEN..],
-                aad: VAULT_AAD,
+                aad,
             },
         )
+        .map(|plaintext| (version, plaintext))
         .map_err(|_| CryptoError::VaultCorrupt)
+}
+
+/// A blob as builds before version 2 wrote it, for migration tests.
+#[cfg(test)]
+pub(crate) fn seal_legacy(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    let nonce = [5u8; NONCE_LEN];
+    let ciphertext = XChaCha20Poly1305::new(key.into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: LEGACY_VAULT_AAD,
+            },
+        )
+        .unwrap();
+    let mut out = vec![LEGACY_VAULT_VERSION];
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
 }
 
 #[cfg(test)]
@@ -137,6 +170,24 @@ mod tests {
         for len in [0usize, 1, 8, 24, 40] {
             assert!(open(&KEY, &vec![VAULT_VERSION; len]).is_err());
         }
+    }
+
+    #[test]
+    fn a_legacy_blob_opens_and_reports_its_version() {
+        let sealed = seal_legacy(&KEY, b"old state");
+        let (version, plaintext) = open_versioned(&KEY, &sealed).unwrap();
+        assert_eq!(version, LEGACY_VAULT_VERSION);
+        assert_eq!(plaintext, b"old state");
+    }
+
+    #[test]
+    fn a_blob_cannot_be_relabelled_as_the_other_version() {
+        let mut sealed = seal(&KEY, b"state").unwrap();
+        sealed[0] = LEGACY_VAULT_VERSION;
+        assert!(matches!(
+            open(&KEY, &sealed),
+            Err(CryptoError::VaultCorrupt)
+        ));
     }
 
     #[test]

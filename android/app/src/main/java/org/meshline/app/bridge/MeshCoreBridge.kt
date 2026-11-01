@@ -3,6 +3,7 @@ package org.meshline.app.bridge
 import android.content.Context
 import android.util.Log
 import org.meshline.app.security.IdentityStore
+import org.meshline.app.security.SecureStateStore
 
 /**
  * Kotlin façade over the `meshline_ffi` native library.
@@ -25,6 +26,10 @@ object MeshCoreBridge {
     @Volatile
     var status: Status = Status.UNINITIALISED
         private set
+
+    /** For the durable writes this bridge makes before releasing anything. */
+    @Volatile
+    private var appContext: Context? = null
 
     private val libraryLoaded: Boolean = try {
         System.loadLibrary("meshline_ffi")
@@ -56,6 +61,7 @@ object MeshCoreBridge {
     @Synchronized
     fun initialise(context: Context): Boolean {
         if (status == Status.READY) return true
+        appContext = context.applicationContext
         if (!libraryLoaded) {
             status = Status.LIBRARY_MISSING
             return false
@@ -156,9 +162,14 @@ object MeshCoreBridge {
      * Builds an encrypted chat packet, or null when no session exists with the
      * recipient. Callers must treat null as "not sent" and offer a handshake,
      * never as a cue to send the text some other way.
+     *
+     * Null also means the nonce reservation could not be made durable. May write
+     * to disk, so call it off the main thread.
      */
-    fun createChat(recipientIdHex: String, message: String): ByteArray? =
-        guarded { nativeCreateChat(recipientIdHex, message) }
+    fun createChat(recipientIdHex: String, message: String): ByteArray? = guarded {
+        ensureNonceReservation()
+        nativeCreateChat(recipientIdHex, message)
+    }
 
     /** [createSos], with the packet's canonical id. */
     fun createSosPacket(
@@ -223,8 +234,10 @@ object MeshCoreBridge {
      * the invite was not created — most often because there is no pairwise
      * session with that peer yet, which is a precondition rather than a bug.
      */
-    fun inviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray? =
-        guarded { nativeInviteToGroup(groupIdHex, peerIdHex) }
+    fun inviteToGroup(groupIdHex: String, peerIdHex: String): ByteArray? = guarded {
+        ensureNonceReservation()
+        nativeInviteToGroup(groupIdHex, peerIdHex)
+    }
 
     /**
      * Builds an encrypted group message, or null when this device holds no key
@@ -237,11 +250,16 @@ object MeshCoreBridge {
      * Removes a member and rotates the group key, returning JSON describing the
      * invites to send and any members that could not be reached.
      */
-    fun removeFromGroup(groupIdHex: String, peerIdHex: String): String? =
-        guarded { nativeRemoveFromGroup(groupIdHex, peerIdHex) }
+    fun removeFromGroup(groupIdHex: String, peerIdHex: String): String? = guarded {
+        ensureNonceReservation()
+        nativeRemoveFromGroup(groupIdHex, peerIdHex)
+    }
 
     /** Rotates a group key without changing membership. */
-    fun rekeyGroup(groupIdHex: String): String? = guarded { nativeRekeyGroup(groupIdHex) }
+    fun rekeyGroup(groupIdHex: String): String? = guarded {
+        ensureNonceReservation()
+        nativeRekeyGroup(groupIdHex)
+    }
 
     fun leaveGroup(groupIdHex: String): Boolean =
         guarded { nativeLeaveGroup(groupIdHex) } ?: false
@@ -252,8 +270,17 @@ object MeshCoreBridge {
     // Secure state at rest
     // -----------------------------------------------------------------------
 
-    /** Seals sessions, group keys, and verifications under a caller-held key. */
+    /**
+     * Seals sessions, group keys, and verifications under a caller-held key.
+     * Only [SecureStateStore] may call this: export, durable write and
+     * [commitState] have to happen as one step.
+     */
     fun exportState(vaultKey: ByteArray): ByteArray? = guarded { nativeExportState(vaultKey) }
+
+    /** The blob from the last [exportState] is on disk, and only then call this. */
+    fun commitState() {
+        guarded { nativeCommitState() }
+    }
 
     /** Restores state sealed by [exportState]. False means it could not be opened. */
     fun importState(vaultKey: ByteArray, blob: ByteArray): Boolean =
@@ -272,15 +299,40 @@ object MeshCoreBridge {
      * For an ACK, mark `acked_message_id` delivered, and only when it is present:
      * the core sets it only for an ACK signed by the node the message was sent
      * to. `msg_id` is the ACK packet's own id and matches no message.
+     *
+     * Anything this returns is safe to show and to ACK: the replay state that
+     * accepted it is durable first, so a crash cannot make a message that was
+     * shown acceptable again. May write to disk, so call it off the main thread.
+     * A failed write is logged and the message still delivered, because losing
+     * a message on a full disk is worse than a replay that also needs a crash;
+     * see docs/decisions/2026-10-31-session-nonce-safety.md.
      */
-    fun processIncoming(rawPacket: ByteArray): String? =
-        guarded { nativeProcessIncoming(rawPacket) }
+    fun processIncoming(rawPacket: ByteArray): String? = guarded {
+        val result = nativeProcessIncoming(rawPacket)
+        if (nativeHasUncommittedReceives() && !persistSecureState()) {
+            Log.e(TAG, "Replay state is not durable; a crash could reopen this message.")
+        }
+        result
+    }
 
     fun activePinsJson(): String? = guarded { nativeActivePinsJson() }
 
     fun updateBattery(batteryLevel: Int, isCharging: Boolean) {
         guarded { nativeUpdateBattery(batteryLevel, isCharging) }
     }
+
+    /**
+     * Tops up the durable nonce reservation before a pairwise encrypt. If the
+     * write fails the core refuses the encrypt, so failing here is failing closed.
+     */
+    private fun ensureNonceReservation() {
+        if (nativeNeedsNonceReservation() && !persistSecureState()) {
+            Log.w(TAG, "Could not reserve nonces durably.")
+        }
+    }
+
+    private fun persistSecureState(): Boolean =
+        appContext?.let { SecureStateStore.persist(it) } ?: false
 
     private inline fun <T> guarded(body: () -> T): T? {
         if (!isReady()) return null
@@ -338,5 +390,8 @@ object MeshCoreBridge {
     private external fun nativeGroupsJson(): String?
     private external fun nativeExportState(vaultKey: ByteArray): ByteArray?
     private external fun nativeImportState(vaultKey: ByteArray, blob: ByteArray): Boolean
+    private external fun nativeCommitState()
+    private external fun nativeNeedsNonceReservation(): Boolean
+    private external fun nativeHasUncommittedReceives(): Boolean
     private external fun nativeWipeSecureState()
 }

@@ -223,6 +223,16 @@ impl MeshSimulator {
             sender = if sender == a { b } else { a };
         }
 
+        // A new session has no durable nonces, so it must refuse to send until
+        // the state holding its reservation is stored.
+        if alice.create_chat_packet(bob.node_id, "too soon").is_ok() {
+            return Err("a chat was sent before its nonces were durable".into());
+        }
+        alice
+            .export_secure_state(&[0u8; 32])
+            .map_err(|e| e.to_string())?;
+        alice.commit_secure_state();
+
         let chat = alice
             .create_chat_packet(bob.node_id, "are you safe?")
             .map_err(|e| e.to_string())?;

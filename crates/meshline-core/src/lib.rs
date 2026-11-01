@@ -9,10 +9,12 @@ pub mod security;
 pub mod transport;
 
 use bincode::Options;
+use crypto::session::LegacyTransportSession;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -124,6 +126,12 @@ pub struct MeshNode {
     pub groups: Arc<Mutex<GroupStore>>,
     pub trust: Arc<Mutex<TrustStore>>,
     pending_acks: Mutex<PendingAcks>,
+    /// Counts receives that moved replay state. Compared against what was last
+    /// made durable, so plaintext can be held back until a crash can no longer
+    /// roll the window behind it.
+    receive_generation: AtomicU64,
+    exported_generation: AtomicU64,
+    committed_generation: AtomicU64,
 }
 
 /// The secure state as it is written to the vault.
@@ -143,6 +151,24 @@ struct SecureStateIn {
     sessions: Vec<TransportSession>,
     groups: GroupStore,
     trust: TrustStore,
+}
+
+/// A vault written before sessions carried a nonce reservation.
+#[derive(Deserialize)]
+struct LegacySecureStateIn {
+    sessions: Vec<LegacyTransportSession>,
+    groups: GroupStore,
+    trust: TrustStore,
+}
+
+impl From<LegacySecureStateIn> for SecureStateIn {
+    fn from(legacy: LegacySecureStateIn) -> Self {
+        Self {
+            sessions: legacy.sessions.into_iter().map(Into::into).collect(),
+            groups: legacy.groups,
+            trust: legacy.trust,
+        }
+    }
 }
 
 impl MeshNode {
@@ -175,6 +201,9 @@ impl MeshNode {
             groups: Arc::new(Mutex::new(GroupStore::new())),
             trust: Arc::new(Mutex::new(TrustStore::new())),
             pending_acks: Mutex::new(PendingAcks::default()),
+            receive_generation: AtomicU64::new(0),
+            exported_generation: AtomicU64::new(0),
+            committed_generation: AtomicU64::new(0),
         }
     }
 
@@ -450,9 +479,16 @@ impl MeshNode {
                 return Err(CryptoError::NotGroupAdmin.into());
             }
         }
-        if !self.has_session_with(&peer_id) {
-            return Err(MeshError::NoSession);
-        }
+        // Before the membership changes: a member added with no invite on its way
+        // would be a member who can never read anything.
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .can_send_to(&peer_id)
+            .map_err(|e| match e {
+                CryptoError::NoSession => MeshError::NoSession,
+                other => MeshError::Crypto(other),
+            })?;
 
         let invite_bytes = {
             let mut groups = self.groups.lock().expect("group mutex poisoned");
@@ -586,8 +622,19 @@ impl MeshNode {
     /// The pending ACK table follows the state as a second value rather than a new
     /// field, so a blob from before it existed still opens and a build that does
     /// not know about it ignores it.
+    ///
+    /// The blob carries a fresh nonce reservation for every session. Once it is
+    /// durably in place, and only then, call
+    /// [`commit_secure_state`](Self::commit_secure_state). There must be one
+    /// writer: export, write and commit as one step, or a commit could cover a
+    /// reservation that another export made and nobody wrote.
     pub fn export_secure_state(&self, vault_key: &[u8; 32]) -> Result<Vec<u8>, MeshError> {
-        let sessions = self.sessions.lock().expect("session mutex poisoned");
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        // Read before serializing: a receive landing in between is then in the
+        // blob and still counted as uncommitted, which costs one extra write. The
+        // other order could call a receive durable that the blob does not hold.
+        let generation = self.receive_generation.load(Ordering::SeqCst);
+        sessions.reserve_for_export();
         let groups = self.groups.lock().expect("group mutex poisoned");
         let trust = self.trust.lock().expect("trust mutex poisoned");
 
@@ -606,7 +653,40 @@ impl MeshNode {
             bincode::serialize(&*pending).map_err(|e| MeshError::Serialization(e.to_string()))?,
         );
 
-        Ok(crypto::vault::seal(vault_key, &plaintext)?)
+        let sealed = crypto::vault::seal(vault_key, &plaintext)?;
+        self.exported_generation.store(generation, Ordering::SeqCst);
+        Ok(sealed)
+    }
+
+    /// Records that the blob from the last export is durably stored, which
+    /// releases its nonce reservations for spending and marks the receives it
+    /// holds as safe from rollback.
+    pub fn commit_secure_state(&self) {
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        sessions.commit_reservations();
+        self.committed_generation.store(
+            self.exported_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// True when a session should get a durable reservation before sending.
+    pub fn needs_nonce_reservation(&self) -> bool {
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .needs_nonce_reservation()
+    }
+
+    /// True when something has been received that a crash would forget.
+    ///
+    /// Plaintext and ACKs from [`process_incoming`](Self::process_incoming) must
+    /// wait until this is false. A crash before then rolls the window back over a
+    /// message nobody has seen, so accepting its retransmission is correct; a
+    /// crash after cannot roll back over anything that was shown.
+    pub fn has_uncommitted_receives(&self) -> bool {
+        self.receive_generation.load(Ordering::SeqCst)
+            != self.committed_generation.load(Ordering::SeqCst)
     }
 
     /// Restores state sealed by [`export_secure_state`](Self::export_secure_state).
@@ -614,15 +694,19 @@ impl MeshNode {
     /// A blob that will not open is treated as absent, not as a reason to run
     /// with half a session table: the caller starts fresh and re-handshakes.
     pub fn import_secure_state(&self, vault_key: &[u8; 32], blob: &[u8]) -> Result<(), MeshError> {
-        let plaintext = crypto::vault::open(vault_key, blob)?;
+        let (version, plaintext) = crypto::vault::open_versioned(vault_key, blob)?;
         let mut decoder = bincode::de::Deserializer::from_slice(
             &plaintext,
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()
                 .allow_trailing_bytes(),
         );
-        let state = SecureStateIn::deserialize(&mut decoder)
-            .map_err(|e| MeshError::Serialization(e.to_string()))?;
+        let decoded = if version == crypto::vault::LEGACY_VAULT_VERSION {
+            LegacySecureStateIn::deserialize(&mut decoder).map(SecureStateIn::from)
+        } else {
+            SecureStateIn::deserialize(&mut decoder)
+        };
+        let state = decoded.map_err(|e| MeshError::Serialization(e.to_string()))?;
         // Absent from older blobs. The AEAD already vouched for these bytes, so
         // running out of them can only mean that, and the messages concerned stay
         // "sent" rather than being called delivered on no evidence.
@@ -754,6 +838,9 @@ impl MeshNode {
                     plaintext = sessions
                         .decrypt_from(&packet.header.sender_id, &packet.payload)
                         .ok();
+                    if plaintext.is_some() {
+                        self.receive_generation.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 PacketType::Ack if addressed_to_us => {
                     // sender_id was bound to the signing key in step 1, so this
@@ -777,6 +864,7 @@ impl MeshNode {
                     };
 
                     if let Some(bytes) = invite_bytes {
+                        self.receive_generation.fetch_add(1, Ordering::SeqCst);
                         if let Ok(invite) = crypto::group::decode_invite(&bytes) {
                             let mut groups = self.groups.lock().expect("group mutex poisoned");
                             if let Ok(outcome) = groups.apply_invite(
@@ -800,6 +888,7 @@ impl MeshNode {
                             if let Ok(text) =
                                 group.decrypt(&packet.header.sender_id, &packet.payload)
                             {
+                                self.receive_generation.fetch_add(1, Ordering::SeqCst);
                                 plaintext = Some(text);
                                 group_id = Some(id);
                                 group_name = Some(group.name.clone());
@@ -1055,6 +1144,15 @@ mod tests {
     /// Drives the three-message XX handshake between two nodes, carried end to
     /// end as ordinary signed mesh packets.
     fn handshake(alice: &MeshNode, bob: &MeshNode) {
+        handshake_without_reserving(alice, bob);
+        for node in [alice, bob] {
+            node.export_secure_state(&[0u8; 32]).unwrap();
+            node.commit_secure_state();
+        }
+    }
+
+    /// The handshake alone, which leaves both sides unable to send.
+    fn handshake_without_reserving(alice: &MeshNode, bob: &MeshNode) {
         let m1 = alice.begin_handshake(bob.node_id).unwrap();
         let m2 = bob
             .process_incoming(&wire(&m1))
@@ -1758,9 +1856,282 @@ mod tests {
     /// and its sealed state, exactly as `MeshCoreBridge` does on launch.
     fn restart(node: &MeshNode, vault_key: &[u8; 32]) -> MeshNode {
         let blob = node.export_secure_state(vault_key).unwrap();
+        restart_from(node, vault_key, &blob)
+    }
+
+    /// The same restart, from whichever blob happened to survive the crash.
+    fn restart_from(node: &MeshNode, vault_key: &[u8; 32], blob: &[u8]) -> MeshNode {
         let restored = MeshNode::from_secret_key(&node.secret_key_bytes());
-        restored.import_secure_state(vault_key, &blob).unwrap();
+        restored.import_secure_state(vault_key, blob).unwrap();
         restored
+    }
+
+    /// Export, write, commit: what `SecureStateStore.persist` does.
+    fn persist(node: &MeshNode, vault_key: &[u8; 32]) -> Vec<u8> {
+        let blob = node.export_secure_state(vault_key).unwrap();
+        node.commit_secure_state();
+        blob
+    }
+
+    /// The counter a chat frame was encrypted under.
+    fn chat_counter(packet: &Packet) -> u64 {
+        u64::from_le_bytes(packet.payload[..8].try_into().unwrap())
+    }
+
+    /// REVIEW C1, end to end through the sealed vault.
+    #[test]
+    fn a_crash_after_sending_cannot_reuse_a_nonce() {
+        let key = [11u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+
+        let on_disk = persist(&alice, &key);
+        let before_crash = alice.create_chat_packet(bob.node_id, "message A").unwrap();
+
+        // Killed before any further write: only `on_disk` survives.
+        let alice_after = restart_from(&alice, &key, &on_disk);
+        assert!(
+            matches!(
+                alice_after.create_chat_packet(bob.node_id, "message B"),
+                Err(MeshError::Crypto(CryptoError::NonceReservationExhausted))
+            ),
+            "a restored session must not send before reserving durably"
+        );
+        assert!(alice_after.needs_nonce_reservation());
+
+        persist(&alice_after, &key);
+        let after_crash = alice_after
+            .create_chat_packet(bob.node_id, "message B")
+            .unwrap();
+
+        assert_ne!(chat_counter(&before_crash), chat_counter(&after_crash));
+        for (packet, text) in [(&before_crash, "message A"), (&after_crash, "message B")] {
+            assert_eq!(
+                bob.process_incoming(&wire(packet))
+                    .unwrap()
+                    .plaintext
+                    .as_deref(),
+                Some(text.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_write_releases_no_counters() {
+        let key = [12u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+        let on_disk = persist(&alice, &key);
+
+        // Restored, then an export whose write fails: no commit follows.
+        let alice_after = restart_from(&alice, &key, &on_disk);
+        let _lost = alice_after.export_secure_state(&key).unwrap();
+
+        assert!(matches!(
+            alice_after.create_chat_packet(bob.node_id, "hello"),
+            Err(MeshError::Crypto(CryptoError::NonceReservationExhausted))
+        ));
+    }
+
+    #[test]
+    fn a_handshake_finishing_during_a_write_is_not_covered_by_its_commit() {
+        let key = [13u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+
+        let _in_flight = alice.export_secure_state(&key).unwrap();
+        handshake_without_reserving(&alice, &bob);
+        alice.commit_secure_state();
+
+        assert!(matches!(
+            alice.create_chat_packet(bob.node_id, "hello"),
+            Err(MeshError::Crypto(CryptoError::NonceReservationExhausted))
+        ));
+    }
+
+    /// The other half of C1: an accepted message that a crash forgets could be
+    /// replayed and accepted a second time.
+    #[test]
+    fn a_receive_window_cannot_roll_back_past_a_released_message() {
+        let key = [14u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+        persist(&bob, &key);
+        assert!(!bob.has_uncommitted_receives());
+
+        let chat = alice.create_chat_packet(bob.node_id, "shown once").unwrap();
+        let received = bob.process_incoming(&wire(&chat)).unwrap();
+        assert!(received.plaintext.is_some());
+
+        // Not yet releasable: a crash now would forget this receive.
+        assert!(bob.has_uncommitted_receives());
+
+        // Following the ordering: write, then release.
+        let on_disk = persist(&bob, &key);
+        assert!(!bob.has_uncommitted_receives());
+
+        // A crash at any later point restores a window that holds the message.
+        let bob_after = restart_from(&bob, &key, &on_disk);
+        assert!(
+            bob_after
+                .process_incoming(&wire(&chat))
+                .unwrap()
+                .plaintext
+                .is_none(),
+            "a message already shown must not be accepted again"
+        );
+    }
+
+    #[test]
+    fn a_crash_before_release_lets_the_retransmission_through() {
+        let key = [15u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+        let on_disk = persist(&bob, &key);
+
+        let chat = alice
+            .create_chat_packet(bob.node_id, "not shown yet")
+            .unwrap();
+        bob.process_incoming(&wire(&chat)).unwrap();
+        assert!(bob.has_uncommitted_receives());
+
+        // Killed before the write, so nothing was shown and no ACK went out. The
+        // sender still holds it, and refusing the retry would lose it for good.
+        let bob_after = restart_from(&bob, &key, &on_disk);
+        assert_eq!(
+            bob_after
+                .process_incoming(&wire(&chat))
+                .unwrap()
+                .plaintext
+                .as_deref(),
+            Some(&b"not shown yet"[..])
+        );
+    }
+
+    #[test]
+    fn a_receive_during_a_write_stays_uncommitted() {
+        let key = [16u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+
+        let _in_flight = bob.export_secure_state(&key).unwrap();
+        let chat = alice
+            .create_chat_packet(bob.node_id, "arrived late")
+            .unwrap();
+        bob.process_incoming(&wire(&chat)).unwrap();
+        bob.commit_secure_state();
+
+        assert!(
+            bob.has_uncommitted_receives(),
+            "the blob that was committed does not hold this receive"
+        );
+    }
+
+    #[test]
+    fn an_invite_is_refused_before_the_membership_changes() {
+        let key = [17u8; 32];
+        let (alice, bob) = (MeshNode::new(), MeshNode::new());
+        handshake(&alice, &bob);
+        let gid = alice.create_group("affinity").unwrap();
+
+        let on_disk = persist(&alice, &key);
+        let alice_after = restart_from(&alice, &key, &on_disk);
+
+        assert!(alice_after.invite_to_group(&gid, bob.node_id).is_err());
+        assert!(
+            !alice_after
+                .groups
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .unwrap()
+                .is_member(&bob.node_id),
+            "a member with no invite on its way could never read anything"
+        );
+    }
+
+    #[test]
+    fn a_v1_vault_migrates_and_skips_past_its_unsaved_counters() {
+        #[derive(Serialize)]
+        struct V1Session {
+            sending_key: [u8; 32],
+            receiving_key: [u8; 32],
+            peer_identity_pubkey: [u8; 32],
+            peer_node_id: [u8; 16],
+            sending_counter: u64,
+            replay: crypto::session::ReplayWindow,
+            established_at: u64,
+        }
+        #[derive(Serialize)]
+        struct V1State {
+            sessions: Vec<V1Session>,
+            groups: GroupStore,
+            trust: TrustStore,
+        }
+
+        let key = [18u8; 32];
+        let (me, peer) = (MeshNode::new(), MeshNode::new());
+        let plaintext = bincode::serialize(&V1State {
+            sessions: vec![V1Session {
+                sending_key: [1u8; 32],
+                receiving_key: [2u8; 32],
+                peer_identity_pubkey: peer.public_key_bytes(),
+                peer_node_id: peer.node_id,
+                sending_counter: 7,
+                replay: crypto::session::ReplayWindow::new(),
+                established_at: 0,
+            }],
+            groups: GroupStore::new(),
+            trust: TrustStore::new(),
+        })
+        .unwrap();
+
+        me.import_secure_state(&key, &crypto::vault::seal_legacy(&key, &plaintext))
+            .unwrap();
+        assert!(me.has_session_with(&peer.node_id));
+
+        persist(&me, &key);
+        let packet = me
+            .create_chat_packet(peer.node_id, "after the update")
+            .unwrap();
+        assert_eq!(chat_counter(&packet), 7 + (1 << 20));
+    }
+
+    #[test]
+    fn a_version_1_blob_keeps_its_pending_acks() {
+        // A-102 builds wrote the pending table after the version 1 state, so the
+        // migration has to read past that state rather than stop at it.
+        #[derive(Serialize)]
+        struct V1State {
+            sessions: Vec<()>,
+            groups: GroupStore,
+            trust: TrustStore,
+        }
+
+        let alice = MeshNode::new();
+        let bob = MeshNode::new();
+        handshake(&alice, &bob);
+        let (msg_id, ack) = chat_and_ack(&alice, &bob);
+        let key = [19u8; 32];
+
+        let mut plaintext = bincode::serialize(&V1State {
+            sessions: Vec::new(),
+            groups: GroupStore::new(),
+            trust: TrustStore::new(),
+        })
+        .unwrap();
+        plaintext.extend(bincode::serialize(&*alice.pending_acks.lock().unwrap()).unwrap());
+
+        let restored = MeshNode::from_secret_key(&alice.secret_key_bytes());
+        restored
+            .import_secure_state(&key, &crypto::vault::seal_legacy(&key, &plaintext))
+            .unwrap();
+        assert_eq!(
+            restored
+                .process_incoming(&wire(&ack))
+                .unwrap()
+                .acked_message_id,
+            Some(msg_id)
+        );
     }
 
     #[test]
