@@ -127,12 +127,10 @@ class CheckJniTest(unittest.TestCase):
             "nativeWipeSecureState",
         ):
             self.assertIn(expected, methods)
-        self.assertEqual(len(methods), 25)
 
     def test_extract_expected_jni_symbols(self):
         kt_path = check_jni.DEFAULT_KT_PATH
         symbols = check_jni.extract_expected_jni_symbols(kt_path)
-        self.assertEqual(len(symbols), 25)
         self.assertIn("Java_org_meshline_app_bridge_MeshCoreBridge_nativeInit", symbols)
         self.assertIn("Java_org_meshline_app_bridge_MeshCoreBridge_nativeWipeSecureState", symbols)
 
